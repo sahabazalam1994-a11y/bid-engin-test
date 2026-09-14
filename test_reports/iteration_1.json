@@ -1,0 +1,34 @@
+{
+  "summary": "Tested /app/engine Node CLI (SAP Bid Engine Rank-1 Hardening). Ran node --check on all 5 files (all pass), verified data.json (162 hashes valid), region-probe runs cleanly, engine loads 'Captcha map loaded: 162 known images' against mock. Executed both E2E scenarios sequentially. Default E2E: 9/9 checks passed, first save at boundary+40ms. Hard E2E: 8/10 checks passed twice (reproducible). Static code review confirms: captcha only fetched inside armCaptcha/fireItem (called from boundary setTimeout), exactly 1 fetchCaptchaImage per submit attempt, lookupCaptcha is pure in-memory Map, classify() returns 'auth'/'http-error' without marking submitted, dead-cookie path returns cleanly without crashing fire loop.",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {"endpoint": "test/run-e2e.js first-save assertion", "issue": "Test picks earliest okSaves[0], but on hard scenario the engine starts during an already-open window and correctly performs a catch-up submit via the tick loop at ~boundary+22-27s. That save becomes the 'first' and violates E2E_MAX_FIRST_MS=1500. The next boundary-aligned window fires at boundary+834ms (well within budget). Suggest filtering saves to only the boundary just crossed after warm-up, or wait for a fresh boundary before recording."},
+      {"endpoint": "test/mock-sap.js WAF burst logic", "issue": "MOCK_WAF_BURST=2 triggers 406 only when >2 submits occur in a 300ms window across ALL sessions. With race-first behaviour only 2-3 submits happen per boundary, so 406 is rarely triggered. Prior 10/10 pass depended on unknown-captcha retries randomly bunching submits. Non-deterministic — recommend using >=WAF_BURST or lower the default threshold (e.g., WAF_BURST=1) so the assertion becomes deterministic."}
+    ]
+  },
+  "frontend_issues": {"ui_bugs": [], "integration_issues": [], "design_issues": []},
+  "test_report_links": [
+    "/app/engine/test/e2e-result.json",
+    "/tmp/e2e-default.log",
+    "/tmp/e2e-hard.log",
+    "/tmp/e2e-hard2.log"
+  ],
+  "action_items": [
+    "Optional test-robustness fix in test/run-e2e.js: skip catch-up saves that occurred >=15s after the previous boundary, OR wait for a fresh boundary before starting the engine so first save is boundary-aligned.",
+    "Optional mock fix in test/mock-sap.js: change WAF trigger to `>= WAF_BURST` (or set default WAF_BURST=1 in hard scenario) to make the check deterministic.",
+    "No engine changes required — bid-engine.js behaves correctly (SAP clock sync +1476-1490ms, fire lead 11ms, captcha armed 21-22ms, first submit at boundary+34-40ms on default, boundary+832-863ms with 800ms unlock delay)."
+  ],
+  "critical_code_review_comments": [
+    "bid-engine.js is 1235 lines — consider splitting fire loop, session/auth mgmt, clock sync, and scheduling into separate modules for maintainability.",
+    "fireItem() (~180 lines) is large; classify() switch cases could be extracted for readability.",
+    "Confirmed correct: captcha lookup is O(1) Map; armCaptcha aborts on WAF or fire-loop; classify() does NOT mark submitted for 401/403/5xx (kinds 'auth'/'http-error'); _deadUntil early-returns cleanly."
+  ],
+  "updated_files": [],
+  "success_rate": {"backend": "e2e default 9/9 (100%), e2e hard 8/10 (80% - failures are test-side flakiness, not engine bugs)"},
+  "seed_data_creation": "Mock fixtures (cookie.txt, cookie2.txt, files/*.csv, test/captcha-map.test.json) auto-created by run-e2e.js.",
+  "retest_needed": false,
+  "main_agent_can_self_test": true,
+  "context_for_next_testing_agent": "Kill mock-sap and bid-engine.js before each run: `pkill -f mock-sap; pkill -f bid-engine.js`. Do not run both E2E scenarios concurrently (port 9443 collision, fixture rewrite). Default e2e takes ~92s, hard e2e ~50s. The two hard-scenario failures are consistently reproducible and test-side; the engine is functioning correctly. Main agent previously got 10/10 by chance/timing.",
+  "rca of the issue": "Failure 1 (first save >1500ms in hard scenario): the engine, when started at any time inside an open bidding window, correctly fires immediately via its non-boundary tick loop (line 1381 [tick] dispatcher). The mock records this save with fromBoundaryMs equal to (Date.now() - windowStart) which can be tens of seconds. The E2E assertion picks the earliest save without filtering catch-up saves, so this early tick-fire consumes the 'first save' slot. Failure 2 (waf406=0): mock-sap.js line 110 uses `recentSubmits.length > WAF_BURST` — with WAF_BURST=2 that requires >2 submits in 300ms, but the engine's race-first stops after first success (typically 2 submits per boundary). Neither is a code bug in bid-engine.js. Mitigation: fix run-e2e.js to only consider boundary-aligned saves, or fix mock threshold to `>=`."
+}

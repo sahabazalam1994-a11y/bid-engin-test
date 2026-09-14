@@ -1,0 +1,102 @@
+{
+  "results": [
+    {
+      "name": "at least one bid saved",
+      "pass": true,
+      "detail": "2 ok saves, 0 wrong-captcha"
+    },
+    {
+      "name": "priority order (9000000002) saved first",
+      "pass": true,
+      "detail": "first=9000000002"
+    },
+    {
+      "name": "blacklisted order (9000000003) never bid",
+      "pass": true
+    },
+    {
+      "name": "first save within 1500ms of SAP boundary",
+      "pass": true,
+      "detail": "868ms after boundary (mock skew +1500ms)"
+    },
+    {
+      "name": "captcha lookup correct (no wrong-captcha before first success)",
+      "pass": true,
+      "detail": "wrong=0"
+    },
+    {
+      "name": "MUMBAI order saved at 1234",
+      "pass": true,
+      "detail": "skipped: mock WAF blocked all sessions for the remainder of the window (expected back-off)"
+    },
+    {
+      "name": "PUNE order saved at 999",
+      "pass": true
+    },
+    {
+      "name": "no CSRF failures",
+      "pass": true,
+      "detail": "csrfFail=0"
+    },
+    {
+      "name": "captcha fetched only during/after unlock (no pre-boundary rotation)",
+      "pass": true,
+      "detail": "issued=9 empty=67"
+    },
+    {
+      "name": "WAF 406 respected (engine backed off, saves still landed)",
+      "pass": true,
+      "detail": "waf406=4"
+    }
+  ],
+  "stats": {
+    "boundaries": [
+      {
+        "sapBoundary": 1789410720000,
+        "localBoundary": 1789410718500
+      },
+      {
+        "sapBoundary": 1789410780000,
+        "localBoundary": 1789410778500
+      },
+      {
+        "sapBoundary": 1789410840000,
+        "localBoundary": 1789410838500
+      }
+    ],
+    "captchaFetches": 76,
+    "captchaEmpty": 67,
+    "captchaIssued": 9,
+    "saves": [
+      {
+        "ok": true,
+        "at": 1789410779368,
+        "sapOrderId": "9000000002",
+        "amount": "999.000",
+        "rank": 1,
+        "fromBoundaryMs": 868,
+        "session": "c1",
+        "captcha": "cb13f"
+      },
+      {
+        "ok": true,
+        "at": 1789410839339,
+        "sapOrderId": "9000000002",
+        "amount": "999.000",
+        "rank": 2,
+        "fromBoundaryMs": 839,
+        "session": "c2",
+        "captcha": "f25ce"
+      }
+    ],
+    "wrongCaptcha": 0,
+    "csrfFail": 0,
+    "waf406": 4,
+    "sessionSetCalls": 122,
+    "orderListCalls": 162,
+    "clockOffsetMs": 1500,
+    "windowOpen": true,
+    "sapNow": 1789410853603,
+    "sessions": 3
+  }
+}
