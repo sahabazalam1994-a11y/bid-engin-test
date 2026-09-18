@@ -22,7 +22,18 @@ keep-alive connection, CSRF re-minted 300ms earlier, fired on **SAP's clock** (n
 | Per-session WAF back-off (other sessions continue) + jitter | `wafActive(session)` |
 | `logs/fire-timing-*.csv` | per attempt: captcha ms, submit ms, total from SAP boundary |
 
+## v4.1 — what the live logs (15–17 Sep) taught us, and what changed
+| Finding (from `fire-timing-*.csv`, `out.log`) | Fix |
+|---|---|
+| Captcha unlocked **~1.0 s after** our boundary every window | Clock source was the WAF's `Date` header (Indusface proxy). Now we sync to the **ABAP backend clock** via the Gateway error XML `<timestamp>` (µs precision) — `CLOCK_SOURCE=backend`. Both offsets are logged so you can see the WAF-vs-backend delta. |
+| Serial probes every ~170 ms → unlock noticed ~85 ms late on average → mostly `tied` | Engine **learns the unlock lag** per window (`logs/unlock-lag-*.csv`, persisted in `logs/clock-state.json`) and times the first probe to **arrive** at `boundary + lag + UNLOCK_MARGIN_MS`. With N sessions the probes are phased `RTT/N` apart so one of them lands within a few ms of the unlock. |
+| 12 distinct map answers rejected as *Wrong Captcha* (`jw62K`, `arch`, `dsjcbka`, …) — OCR-polluted map, rejections lost on restart | Rejections persisted to `captcha-bad.json` (excluded on load) + image saved to `logs/wrong-captcha/<hash>__was-<answer>.png` for relabelling. Optional `CAPTCHA_FALLBACK_URL` (your old `bidding.js`) is used **only** for unknown/rejected hashes; an accepted fallback answer is auto-learned into `data.json`. |
+| `BidOrderListSet` takes 2.7–3.7 s at the boundary | `ORDERS_FREEZE_MS=1500`: once the cached orders yield a plan, no order fetch is issued in the last 1.5 s — only captcha + submit are in flight at the open. Cached orders were already dispatched at T-0 (no fetch). |
+
+Expected after 1–2 live windows: `🔓 captcha UNLOCK observed at boundary+~1000ms` → next window `⏲ holding first probe …` → first submit ≈ unlock + captcha RTT + ~20 ms (vs unlock + 85–170 ms before). **Add cookie2.txt / cookie3.txt** — each extra session halves the detection granularity.
+
 ## Files
+
 ```
 bid-engine.js            v4 engine (single file)
 logger.js                tiny logger (stdout + logs/engine-YYYY-MM-DD.log)

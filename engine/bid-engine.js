@@ -58,7 +58,7 @@ const FIRE_MAX_WAIT_MS        = envInt('FIRE_MAX_WAIT_MS', 90000);  // give up w
 const FIRE_MAX_ATTEMPTS       = envInt('FIRE_MAX_ATTEMPTS', 12);    // submits per item per window
 const CAPTCHA_EMPTY_RETRY_MS  = envInt('CAPTCHA_EMPTY_RETRY_MS', 25);
 const CAPTCHA_EMPTY_SLOW_MS   = envInt('CAPTCHA_EMPTY_SLOW_MS', 100); // after 3s of empties
-const SESSION_STAGGER_MS      = envInt('SESSION_STAGGER_MS', 40);
+const SESSION_STAGGER_MS      = envInt('SESSION_STAGGER_MS', 0);           // extra race stagger (probe phasing already spreads sessions)
 const FIRE_RACE_FIRST         = envBool('FIRE_RACE_FIRST', 'true'); // all sessions race the first item
 const MAX_INFLIGHT_SUBMITS    = envInt('MAX_INFLIGHT_SUBMITS', 3);
 const SUBMIT_MIN_GAP_MS       = envInt('SUBMIT_MIN_GAP_MS', 0);           // global spacing between submit sends (WAF dial)
@@ -70,10 +70,16 @@ const ARM_CAPTCHA_AT_BOUNDARY = envBool('ARM_CAPTCHA_AT_BOUNDARY', 'true'); // f
 const ARMED_CAPTCHA_MAX_AGE_MS = envInt('ARMED_CAPTCHA_MAX_AGE_MS', 5000);
 
 // Clock sync
+const CLOCK_SOURCE            = (process.env.CLOCK_SOURCE || 'backend').toLowerCase(); // backend | date
+const CLOCK_BACKEND_PROBES    = envInt('CLOCK_BACKEND_PROBES', 9);
 const CLOCK_SYNC_LEAD_MS      = envInt('CLOCK_SYNC_LEAD_MS', 20000);
 const CLOCK_SYNC_DURATION_MS  = envInt('CLOCK_SYNC_DURATION_MS', 6000);
 const CLOCK_SYNC_INTERVAL_MS  = envInt('CLOCK_SYNC_INTERVAL_MS', 100);
 const SAP_CLOCK_OFFSET_MS     = process.env.SAP_CLOCK_OFFSET_MS !== undefined ? parseInt(process.env.SAP_CLOCK_OFFSET_MS, 10) : null;
+const UNLOCK_LAG_MS           = envInt('UNLOCK_LAG_MS', -1);            // -1 = learn from live windows
+const UNLOCK_MARGIN_MS        = envInt('UNLOCK_MARGIN_MS', 15);          // aim first probe this far after unlock
+const ORDERS_FREEZE_MS        = envInt('ORDERS_FREEZE_MS', 1500);        // stop order fetches this close to boundary when plan is ready
+const CAPTCHA_FALLBACK_URL    = process.env.CAPTCHA_FALLBACK_URL || '';   // optional legacy solver for unknown/bad hashes
 
 // Undercut / adjust
 const L1_UNDERCUT              = envBool('L1_UNDERCUT', 'true');
@@ -177,9 +183,16 @@ function boundaryStatusText() {
 const clock = {
   offsetMs: SAP_CLOCK_OFFSET_MS ?? 0,
   coarseOffsetMs: 0,
+  dateOffsetMs: null,
+  backendOffsetMs: null,
+  source: SAP_CLOCK_OFFSET_MS != null ? 'env' : 'none',
   rttMs: 150,
   rttSamples: [],
   edges: [],
+  backendSamples: [],
+  unlockLagSamples: [],
+  unlockLagMs: Math.max(0, UNLOCK_LAG_MS),
+  unlockNotedWin: 0,
   synced: SAP_CLOCK_OFFSET_MS != null,
   lastSyncAt: 0,
 };
@@ -219,33 +232,132 @@ async function clockProbe(auth) {
 
 async function syncSapClock(auth) {
   if (SAP_CLOCK_OFFSET_MS != null) return;
+  const dateSync = syncViaDateHeader(auth);           // WAF/ICM clock (1s header, edge-refined)
+  const backendSync = CLOCK_SOURCE === 'backend' ? syncViaBackendTimestamp(auth) : Promise.resolve(null);
+  const [dateOff, backendOff] = await Promise.all([dateSync, backendSync]);
+  clock.dateOffsetMs = dateOff;
+  clock.backendOffsetMs = backendOff;
+  if (backendOff != null) {
+    clock.offsetMs = backendOff; clock.source = 'backend';
+  } else if (dateOff != null) {
+    clock.offsetMs = dateOff; clock.source = 'date-header';
+  } else if (clock.coarseOffsetMs) {
+    clock.offsetMs = clock.coarseOffsetMs; clock.source = 'date-coarse';
+  }
+  clock.synced = true;
+  clock.lastSyncAt = Date.now();
+  const delta = (backendOff != null && dateOff != null) ? ` | WAF-vs-backend delta ${dateOff - backendOff}ms` : '';
+  log.info(`🕰  SAP clock sync [${clock.source}]: offset=${clock.offsetMs > 0 ? '+' : ''}${clock.offsetMs}ms (SAP ${clock.offsetMs >= 0 ? 'ahead' : 'behind'}) backend=${backendOff ?? 'n/a'}ms date-hdr=${dateOff ?? 'n/a'}ms${delta} | rtt=${clock.rttMs}ms | unlock-lag=${clock.unlockLagMs}ms (${clock.unlockLagSamples.length} windows) → first probe arrives boundary+${clock.unlockLagMs + UNLOCK_MARGIN_MS}ms`);
+  saveClockState();
+}
+
+async function syncViaDateHeader(auth) {
   const end = Date.now() + CLOCK_SYNC_DURATION_MS;
   let prev = null;
   const edges = [];
-  let probes = 0;
   while (Date.now() < end) {
     const p = await clockProbe(auth);
-    probes++;
     if (p) {
-      if (prev && p.sapSec === prev.sapSec + 1) {
-        const boundaryLocal = (prev.mid + p.mid) / 2;
-        edges.push(Math.round(p.sapSec * 1000 - boundaryLocal));
-      }
+      if (prev && p.sapSec === prev.sapSec + 1) edges.push(Math.round(p.sapSec * 1000 - (prev.mid + p.mid) / 2));
       prev = p;
     }
     await sleep(CLOCK_SYNC_INTERVAL_MS);
   }
-  if (edges.length) {
-    const s = [...edges].sort((a, b) => a - b);
-    clock.offsetMs = s[Math.floor(s.length / 2)];
-    clock.edges = edges;
-    clock.synced = true;
-  } else if (probes && clock.coarseOffsetMs) {
-    clock.offsetMs = clock.coarseOffsetMs;
-    clock.synced = true;
+  clock.edges = edges;
+  if (!edges.length) return null;
+  const s = [...edges].sort((a, b) => a - b);
+  return s[Math.floor(s.length / 2)];
+}
+
+// Backend (ABAP) clock: any bad OData URI returns a Gateway error XML with
+// <timestamp>YYYYMMDDhhmmss.fffffff</timestamp> taken at processing time (µs).
+// offset = backendTs - (t0 + t1)/2. Median of N probes.
+async function backendClockProbe(auth) {
+  const t0 = Date.now();
+  try {
+    const r = await sapPool.request({
+      path: `${SAP_PFX}/ClockProbe${t0 % 1000}Set`, method: 'GET',
+      headers: auth.headers({ accept: 'application/xml' }), headersTimeout: 3_000, bodyTimeout: 3_000,
+    });
+    const text = await r.body.text();
+    const t1 = Date.now();
+    const m = /<timestamp>(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})\.?(\d{0,7})<\/timestamp>/i.exec(text);
+    if (!m) { clock.backendProbeErr = `HTTP ${r.statusCode} no <timestamp> (${text.slice(0, 80).replace(/\s+/g, ' ')})`; return null; }
+    const frac = m[7] ? parseInt((m[7] + '0000000').slice(0, 3), 10) : 0;
+    const utcMs = Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6], frac);
+    const mid = (t0 + t1) / 2;
+    // Timestamp may be UTC or system-local (IST): pick the interpretation with the smaller |offset|.
+    const cands = [utcMs - mid, utcMs - IST_OFFSET_MS - mid];
+    const off = cands.reduce((a, b) => (Math.abs(b) < Math.abs(a) ? b : a));
+    noteRtt(t1 - t0);
+    return { offset: Math.round(off), rtt: t1 - t0 };
+  } catch (e) { clock.backendProbeErr = e.message; return null; }
+}
+
+async function syncViaBackendTimestamp(auth) {
+  const samples = [];
+  for (let i = 0; i < CLOCK_BACKEND_PROBES; i++) {
+    const p = await backendClockProbe(auth);
+    if (p) samples.push(p);
+    await sleep(CLOCK_SYNC_INTERVAL_MS + 50);
   }
-  clock.lastSyncAt = Date.now();
-  log.info(`🕰  SAP clock sync: offset=${clock.offsetMs > 0 ? '+' : ''}${clock.offsetMs}ms (SAP ${clock.offsetMs >= 0 ? 'ahead' : 'behind'}), edges=${edges.length} [${edges.join(',')}], rtt=${clock.rttMs}ms → fire lead ${fireLeadMs()}ms`);
+  if (!samples.length) { log.warn(`backend clock probe unusable (${clock.backendProbeErr || 'no samples'}) — falling back to Date header`); return null; }
+  // Prefer low-RTT samples (less asymmetric), then median.
+  samples.sort((a, b) => a.rtt - b.rtt);
+  const best = samples.slice(0, Math.max(3, Math.ceil(samples.length / 2))).map((s) => s.offset).sort((a, b) => a - b);
+  clock.backendSamples = samples.map((s) => s.offset);
+  return best[Math.floor(best.length / 2)];
+}
+
+// ---- Unlock-lag learning ------------------------------------------------------
+// SAP unlocks the captcha some fixed lag after the boundary (observed ≈1s on its
+// clock). We learn it per window from the first non-empty captcha and aim the
+// first probe to ARRIVE at boundary + lag + margin. Persisted across restarts.
+const CLOCK_STATE_FILE = path.join(LOGS_DIR, 'clock-state.json');
+function loadClockState() {
+  try {
+    const s = JSON.parse(fs.readFileSync(CLOCK_STATE_FILE, 'utf8'));
+    if (Array.isArray(s.unlockLagSamples)) clock.unlockLagSamples = s.unlockLagSamples.slice(-20);
+    recomputeUnlockLag();
+  } catch (_) { /* first run */ }
+}
+function saveClockState() {
+  try { fs.writeFileSync(CLOCK_STATE_FILE, JSON.stringify({ unlockLagSamples: clock.unlockLagSamples, unlockLagMs: clock.unlockLagMs, lastOffsetMs: clock.offsetMs, savedAt: new Date().toISOString() })); } catch (_) { /* ignore */ }
+}
+function recomputeUnlockLag() {
+  if (UNLOCK_LAG_MS >= 0) { clock.unlockLagMs = UNLOCK_LAG_MS; return; }
+  const s = clock.unlockLagSamples.filter((v) => Number.isFinite(v) && v > -2000 && v < 30000).sort((a, b) => a - b);
+  if (!s.length) { clock.unlockLagMs = 0; return; }
+  // measured lag = true lag + detection delay (0..RTT) → the low quantile is closest to truth
+  clock.unlockLagMs = Math.max(0, s[Math.floor(s.length * 0.2)]);
+}
+// Called with the local send time of the first probe that returned a captcha, plus
+// (if any) the send time of the last EMPTY probe before it → unlock ∈ (empty, hit].
+function noteUnlock(winKey, tReqLocal, tRespLocal, sid, lastEmptyReqLocal = 0) {
+  if (clock.unlockNotedWin === winKey) return;
+  clock.unlockNotedWin = winKey;
+  const hitProc = tReqLocal + oneWayMs() + clock.offsetMs;   // SAP time when the hit probe was processed
+  const hitLag = Math.round(hitProc - winKey);
+  let lag;
+  if (lastEmptyReqLocal && tReqLocal - lastEmptyReqLocal < 2 * clock.rttMs + 200) {
+    const emptyLag = Math.round(lastEmptyReqLocal + oneWayMs() + clock.offsetMs - winKey);
+    lag = Math.round((emptyLag + hitLag) / 2);                // bracketed → midpoint
+  } else {
+    lag = hitLag - UNLOCK_MARGIN_MS - 10;                     // first probe already unlocked → nudge earlier
+  }
+  clock.unlockLagSamples.push(lag);
+  if (clock.unlockLagSamples.length > 20) clock.unlockLagSamples.shift();
+  const before = clock.unlockLagMs;
+  recomputeUnlockLag();
+  unlockLog.write([new Date().toISOString(), istHHMM(winKey), sid, winKey, tReqLocal, tRespLocal, clock.offsetMs, clock.rttMs, hitLag, clock.unlockLagMs]);
+  log.info(`🔓 captcha UNLOCK observed at boundary+${hitLag}ms (SAP ${clock.source} clock${lastEmptyReqLocal ? ', bracketed' : ', first probe already open'}) — learned lag ${before}→${clock.unlockLagMs}ms (${clock.unlockLagSamples.length} samples)`);
+  saveClockState();
+}
+// Local instant at which session #idx should SEND its first captcha probe so it
+// arrives at SAP at boundary + lag + margin (+ per-session phase spread).
+function firstProbeLocalMs(boundaryMs, idx = 0, n = 1) {
+  const phase = n > 1 ? Math.round((idx * clock.rttMs) / n) : 0;
+  return boundaryMs + clock.unlockLagMs + UNLOCK_MARGIN_MS + phase - clock.offsetMs - oneWayMs();
 }
 
 // ---- WAF back-off (per-session, escalates to global) --------------------------
@@ -388,6 +500,7 @@ function csvLogger(prefix, header) {
 }
 const bidLog  = csvLogger('bids', 'timestamp,session,sap_order_id,city,spi,csv_rate,submit_ms,status,message');
 const fireLog = csvLogger('fire-timing', 'ts,window,session,attempt,t_boundary_sap_ms,t_captcha_req_ms,t_captcha_resp_ms,captcha_ms,lookup_hit,t_submit_req_ms,t_submit_resp_ms,submit_ms,total_from_boundary_ms,status');
+const unlockLog = csvLogger('unlock-lag', 'ts,window,session,boundary_ms,probe_sent_local_ms,probe_resp_local_ms,sap_offset_ms,rtt_ms,unlock_lag_ms,learned_lag_ms');
 
 function writeBid(session, b, submitMs, status, message) {
   bidLog.write([new Date().toISOString(), session, b.order.SapOrderId, b.city, b.spi, b.amount, submitMs ?? '', status, message]);
@@ -454,14 +567,23 @@ function metricsDump() {
 
 const captchaMap = new Map();
 const unknownSeen = new Set();
+const BAD_MAP_FILE = path.join(ROOT, 'captcha-bad.json');
+let badAnswers = {};                       // hash → { wrong, ts, count }
 
 function loadCaptchaMap() {
+  try { badAnswers = JSON.parse(fs.readFileSync(BAD_MAP_FILE, 'utf8')) || {}; } catch (_) { badAnswers = {}; }
   try {
     const raw = JSON.parse(fs.readFileSync(CAPTCHA_MAP_FILE, 'utf8'));
     const list = Array.isArray(raw) ? raw : Object.entries(raw).map(([hash, result]) => ({ hash, result }));
     captchaMap.clear();
-    for (const e of list) if (e && e.hash && e.result) captchaMap.set(String(e.hash).toLowerCase(), String(e.result));
-    log.info(`🧩 Captcha map loaded: ${captchaMap.size} known images from ${path.basename(CAPTCHA_MAP_FILE)} (sha256 of base64 → answer, in-process)`);
+    let skipped = 0;
+    for (const e of list) {
+      if (!e || !e.hash || !e.result) continue;
+      const h = String(e.hash).toLowerCase();
+      if (badAnswers[h] && badAnswers[h].wrong === String(e.result)) { skipped++; continue; }
+      captchaMap.set(h, String(e.result));
+    }
+    log.info(`🧩 Captcha map loaded: ${captchaMap.size} known images from ${path.basename(CAPTCHA_MAP_FILE)} (in-process sha256 lookup)${skipped ? ` — ${skipped} answers excluded: SAP rejected them earlier (see captcha-bad.json + logs/wrong-captcha/)` : ''}${CAPTCHA_FALLBACK_URL ? ` | fallback solver ${CAPTCHA_FALLBACK_URL}` : ''}`);
   } catch (e) {
     log.error(`Captcha map load failed (${CAPTCHA_MAP_FILE}): ${e.message}`);
   }
@@ -469,13 +591,43 @@ function loadCaptchaMap() {
 const stripDataUri = (b64) => (typeof b64 === 'string' && b64.includes(',') ? b64.split(',')[1] : b64);
 const sha256 = (s) => crypto.createHash('sha256').update(s).digest('hex');
 
-// Returns { solved, hash } — solved '' when unknown. Microseconds.
+// Returns { solved, hash, raw, source } — solved '' when unknown. Microseconds.
 function lookupCaptcha(img) {
   const raw = stripDataUri(img);
   const hash = sha256(raw);
   const solved = captchaMap.get(hash) || '';
   if (!solved) logUnknownCaptcha(hash, raw);
-  return { solved, hash };
+  return { solved, hash, raw, source: 'map' };
+}
+
+// Opt-in: legacy HTTP solver (bidding.js / TrueCaptcha) for unknown or rejected hashes only.
+async function fallbackSolve(raw) {
+  if (!CAPTCHA_FALLBACK_URL) return '';
+  const t0 = Date.now();
+  try {
+    const u = new URL(CAPTCHA_FALLBACK_URL);
+    const r = await fallbackPool.request({ path: u.pathname || '/', method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ base64Image: raw }), headersTimeout: 8_000, bodyTimeout: 8_000 });
+    const j = JSON.parse(await r.body.text());
+    const s = (j.solved || '').toString().trim();
+    if (s && s !== 'Redo') { log.info(`🧩 fallback solver → "${s}" in ${Date.now() - t0}ms`); return s; }
+  } catch (e) { log.warn(`fallback solver failed: ${e.message}`); }
+  return '';
+}
+const fallbackPool = CAPTCHA_FALLBACK_URL ? new Pool(new URL(CAPTCHA_FALLBACK_URL).origin, { connections: 2, keepAliveTimeout: 30_000 }) : null;
+
+// SAP accepted an answer that did not come from the map → learn it into the map file.
+function learnCaptcha(hash, answer) {
+  if (!hash || !answer || captchaMap.get(hash) === answer) return;
+  captchaMap.set(hash, answer);
+  try {
+    const raw = JSON.parse(fs.readFileSync(CAPTCHA_MAP_FILE, 'utf8'));
+    const list = Array.isArray(raw) ? raw.filter((e) => e && e.hash !== hash) : Object.entries(raw).map(([h, result]) => ({ hash: h, result })).filter((e) => e.hash !== hash);
+    list.push({ hash, file: `learned-${Date.now()}.png`, result: answer, savedAt: Date.now() });
+    fs.writeFileSync(CAPTCHA_MAP_FILE, JSON.stringify(list, null, 2));
+    delete badAnswers[hash];
+    fs.writeFileSync(BAD_MAP_FILE, JSON.stringify(badAnswers, null, 2));
+    log.info(`🧩 LEARNED captcha ${hash.slice(0, 12)}… = "${answer}" (SAP accepted) → saved to ${path.basename(CAPTCHA_MAP_FILE)}`);
+  } catch (e) { log.warn(`learnCaptcha write failed: ${e.message}`); }
 }
 function logUnknownCaptcha(hash, raw) {
   metrics.captchaUnknown++;
@@ -489,10 +641,20 @@ function logUnknownCaptcha(hash, raw) {
     log.warn(`🧩 UNKNOWN captcha hash ${hash.slice(0, 12)}… — saved logs/unknown-captcha/${hash.slice(0, 12)}….png. Add {"hash","result"} to ${path.basename(CAPTCHA_MAP_FILE)} (hot-reloaded).`);
   } catch (_) { /* ignore */ }
 }
-function dropCaptchaAnswer(hash, wrong) {
-  if (!hash || !captchaMap.has(hash)) return;
+function dropCaptchaAnswer(hash, wrong, raw) {
+  if (!hash) return;
   captchaMap.delete(hash);
-  log.warn(`🧩 SAP rejected answer "${wrong}" for hash ${hash.slice(0, 12)}… — removed from in-memory map for this run (fix ${path.basename(CAPTCHA_MAP_FILE)}).`);
+  const prev = badAnswers[hash] || { count: 0 };
+  badAnswers[hash] = { wrong, ts: new Date().toISOString(), count: prev.count + 1 };
+  try {
+    fs.writeFileSync(BAD_MAP_FILE, JSON.stringify(badAnswers, null, 2));
+    if (raw) {
+      const dir = path.join(LOGS_DIR, 'wrong-captcha');
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, `${hash.slice(0, 16)}__was-${String(wrong).replace(/[^A-Za-z0-9]/g, '_')}.png`), Buffer.from(raw, 'base64'));
+    }
+  } catch (_) { /* ignore */ }
+  log.warn(`🧩 SAP rejected answer "${wrong}" for hash ${hash.slice(0, 12)}… — PERSISTED to captcha-bad.json (excluded on every restart). Image: logs/wrong-captcha/${hash.slice(0, 16)}__was-*.png → read it and fix ${path.basename(CAPTCHA_MAP_FILE)}.`);
 }
 
 // ---- CSV rules ---------------------------------------------------------------
@@ -806,7 +968,10 @@ async function fireItem(ctx, auth, item, race = null) {
   let attempts = 0;
   let emptyCount = 0;
   let firstEmptyAt = 0;
+  let lastEmptyReq = 0;
   let lastCaptchaHash = null;
+  let lastCaptchaRaw = null;
+  let solvedSource = 'map';
 
   const done = (result) => result;
   const isRaceDone = () => race && race.done;
@@ -824,16 +989,23 @@ async function fireItem(ctx, auth, item, race = null) {
     if (auth._lastCaptchaFlag === '' || (auth._lastCaptchaFlag === undefined && sapState.captchaFlag === '')) {
       solved = '__NO_CAPTCHA_REQUIRED__';
     } else if (armed && Date.now() - armed.at < ARMED_CAPTCHA_MAX_AGE_MS) {
-      solved = armed.solved; lastCaptchaHash = armed.hash; tCapReq = armed.t0; tCapResp = armed.at;
+      solved = armed.solved; lastCaptchaHash = armed.hash; lastCaptchaRaw = armed.raw; solvedSource = armed.source || 'map'; tCapReq = armed.t0; tCapResp = armed.at;
       metrics.captchaHit++;
       log.info(`[${sid}] ⚡ using armed captcha (fetched ${Date.now() - armed.at}ms ago, in parallel with orders)`);
     } else {
+      // First probe of the window: wait so it ARRIVES at SAP at boundary + learned unlock lag + margin.
+      if (emptyCount === 0 && !lastCaptchaHash) {
+        const idx = Math.max(0, ctx.sessions.indexOf(auth));
+        const wait = firstProbeLocalMs(winKey, idx, ctx.sessions.length) - Date.now();
+        if (wait > 0 && wait < 120_000) { log.info(`[${sid}] ⏲  holding first probe ${wait}ms → arrives boundary+${clock.unlockLagMs + UNLOCK_MARGIN_MS}ms (lag ${clock.unlockLagMs} + margin ${UNLOCK_MARGIN_MS}, phase ${idx}/${ctx.sessions.length})`); await sleep(wait); }
+      }
       tCapReq = Date.now();
       const { img, reason } = await fetchCaptchaImage(auth);
       tCapResp = Date.now();
       if (!img) {
         if (reason === 'sap-empty') {
           emptyCount++;
+          lastEmptyReq = tCapReq;
           if (!firstEmptyAt) firstEmptyAt = Date.now();
           if (emptyCount === 1 || emptyCount % 40 === 0) log.info(`[${sid}] ⏳ captcha not unlocked yet (${emptyCount} empties, ${boundaryStatusText()})`);
           const slow = Date.now() - firstEmptyAt > 3000;
@@ -844,12 +1016,13 @@ async function fireItem(ctx, auth, item, race = null) {
         await sleep(150 + jitter(50));
         continue;
       }
+      noteUnlock(winKey, tCapReq, tCapResp, sid, lastEmptyReq);
       const lk = lookupCaptcha(img);
-      lastCaptchaHash = lk.hash;
+      lastCaptchaHash = lk.hash; lastCaptchaRaw = lk.raw; solvedSource = 'map';
       if (!lk.solved) {
-        // Unknown image: this captcha is now burnt; fetch a fresh one.
-        await sleep(30 + jitter(20));
-        continue;
+        const fb = await fallbackSolve(lk.raw);
+        if (!fb) { await sleep(30 + jitter(20)); continue; }   // unknown image burnt; fetch a fresh one
+        lk.solved = fb; solvedSource = 'fallback';
       }
       metrics.captchaHit++;
       solved = lk.solved;
@@ -889,6 +1062,7 @@ async function fireItem(ctx, auth, item, race = null) {
       case 'ok': {
         if (race) race.done = true;
         metrics.submitsOk++;
+        if (solvedSource === 'fallback') learnCaptcha(lastCaptchaHash, solved);
         log.info(`[${sid}] ✓ ACCEPTED (${item.kind}, ${item.bids.length}) attempt ${attempts} in ${r.submitMs}ms: ${c.silent ? `HTTP ${r.statusCode} silent save` : r.text}${rankStr}`);
         for (const b of item.bids) {
           ctx.submitted.set(String(b.order.SapOrderId), Date.now());
@@ -901,6 +1075,7 @@ async function fireItem(ctx, auth, item, race = null) {
       case 'tied': {
         if (race) race.done = true;
         metrics.submitsOk++;
+        if (solvedSource === 'fallback') learnCaptcha(lastCaptchaHash, solved);
         log.info(`[${sid}] ✓ SAVED-TIED (${item.kind}) in ${r.submitMs}ms — other vendor landed same amount first. ${r.evText.trim()}`);
         for (const b of item.bids) { ctx.submitted.set(String(b.order.SapOrderId), Date.now()); writeBid(sid, b, r.submitMs, 'SAVED_TIED', r.evText.trim()); }
         schedulePostSave(ctx, auth, item);
@@ -908,8 +1083,8 @@ async function fireItem(ctx, auth, item, race = null) {
       }
       case 'wrong-captcha': {
         metrics.submitsWrongCaptcha++;
-        dropCaptchaAnswer(lastCaptchaHash, solved);
-        log.warn(`[${sid}] ↻ Wrong captcha (attempt ${attempts}) — fresh pair`);
+        if (solvedSource === 'map') dropCaptchaAnswer(lastCaptchaHash, solved, lastCaptchaRaw);
+        log.warn(`[${sid}] ↻ Wrong captcha (attempt ${attempts}, answer "${solved}" from ${solvedSource}) — fresh pair`);
         break;
       }
       case 'ghost': {
@@ -989,22 +1164,30 @@ function totalInFlight(ctx) { return ctx.sessions.reduce((a, s) => a + s.inFligh
 // Post-boundary only: fetch ONE captcha per session while orders are still
 // being fetched, so the first submit needs a single round-trip. Aborts the
 // moment a fire loop starts on this session (it would rotate the captcha).
-function armCaptcha(auth) {
+function armCaptcha(ctx, auth, winKey) {
   if (!ARM_CAPTCHA_AT_BOUNDARY || sapState.captchaFlag === '' || auth.arming) return;
   auth.arming = (async () => {
     const start = Date.now();
     let empties = 0;
+    let lastEmptyReq = 0;
+    const idx = Math.max(0, ctx.sessions.indexOf(auth));
+    const hold = firstProbeLocalMs(winKey, idx, ctx.sessions.length) - Date.now();
+    if (hold > 0 && hold < 120_000) await sleep(hold);
     while (Date.now() - start < FIRE_MAX_WAIT_MS && !wafActive(auth) && !auth.mutex._busy) {
       const t0 = Date.now();
       const { img, reason } = await fetchCaptchaImage(auth);
       if (img) {
+        noteUnlock(winKey, t0, Date.now(), auth.id, lastEmptyReq);
         const lk = lookupCaptcha(img);
-        if (lk.solved) { auth.armed = { solved: lk.solved, hash: lk.hash, t0, at: Date.now() }; log.info(`[${auth.id}] 🔫 captcha armed (${Date.now() - t0}ms, after ${empties} empties) — waiting for orders`); return; }
+        let source = 'map';
+        if (!lk.solved) { lk.solved = await fallbackSolve(lk.raw); source = 'fallback'; }
+        if (lk.solved) { auth.armed = { solved: lk.solved, hash: lk.hash, raw: lk.raw, source, t0, at: Date.now() }; log.info(`[${auth.id}] 🔫 captcha armed (${Date.now() - t0}ms, after ${empties} empties) — waiting for orders`); return; }
         await sleep(30 + jitter(20));
         continue;
       }
       if (reason !== 'sap-empty') { await sleep(150 + jitter(50)); continue; }
       empties++;
+      lastEmptyReq = t0;
       if (empties === 1 || empties % 40 === 0) log.info(`[${auth.id}] ⏳ arming: captcha not unlocked yet (${empties} empties, ${boundaryStatusText()})`);
       await sleep((Date.now() - start > 3000 ? CAPTCHA_EMPTY_SLOW_MS : CAPTCHA_EMPTY_RETRY_MS) + jitter(8));
     }
@@ -1131,13 +1314,14 @@ function startKeepWarm(sessions) {
 // ---- Main --------------------------------------------------------------------
 
 async function main() {
-  log.info('🚀 Bikas Bidding v4.0 engine — Rank-1 hardening (embedded captcha map, SAP-clock fire, no pre-fetch)');
+  log.info('🚀 Bikas Bidding v4.1 engine — backend-clock sync, learned unlock lag, embedded captcha map');
   const sessions = discoverSessions().map((sp) => new AuthConfig(sp.id, sp.cookieFile, sp.tokenFile));
   sessionsRef = sessions;
   loadCaptchaMap();
+  loadClockState();
   fs.watchFile(CAPTCHA_MAP_FILE, { interval: 5000 }, () => { log.info('🧩 captcha map changed on disk — reloading'); loadCaptchaMap(); });
 
-  log.info(`Config: sessions=${sessions.map((s) => s.id).join(',')} windows=[${WINDOW_MINUTES.join(',')}] IST batch=${BATCH_SIZE} race-first=${FIRE_RACE_FIRST} stagger=${SESSION_STAGGER_MS}ms max-inflight=${MAX_INFLIGHT_SUBMITS} csrf-lead=${CSRF_REMINT_LEAD_MS}ms h2=${SAP_HTTP2} sap=${SAP_ORIGIN}`);
+  log.info(`Config: sessions=${sessions.map((s) => s.id).join(',')} windows=[${WINDOW_MINUTES.join(',')}] IST batch=${BATCH_SIZE} race-first=${FIRE_RACE_FIRST} max-inflight=${MAX_INFLIGHT_SUBMITS} csrf-lead=${CSRF_REMINT_LEAD_MS}ms clock=${CLOCK_SOURCE} unlock-lag=${UNLOCK_LAG_MS < 0 ? `learned(${clock.unlockLagMs}ms)` : UNLOCK_LAG_MS + 'ms'} margin=${UNLOCK_MARGIN_MS}ms freeze=${ORDERS_FREEZE_MS}ms h2=${SAP_HTTP2} sap=${SAP_ORIGIN}`);
 
   await Promise.all(sessions.map((s) => s.refreshToken().catch((e) => log.warn(`[${s.id}] initial CSRF failed: ${e.message}`))));
   await Promise.all(sessions.map((s) => clockProbe(s)));
@@ -1166,6 +1350,12 @@ async function main() {
     const until = msUntilNextWindow();
     const hot = until <= ORDERS_POLL_LEAD_MS || isActiveWindow();
     if (!hot) return;
+    // Freeze: close to the boundary, if the cached orders already yield a plan, keep SAP idle
+    // so nothing but captcha+submit is in flight at the open instant.
+    if (until > 0 && until <= ORDERS_FREEZE_MS && ctx.cachedOrders && ctx.cachedOrders.length && buildBatches(ctx.cachedOrders, ctx).plan.length) {
+      if (ctx.freezeLoggedWin !== nextBoundaryMs(sapNow())) { ctx.freezeLoggedWin = nextBoundaryMs(sapNow()); log.info(`🧊 orders frozen ${until}ms before boundary — plan ready from cache, no fetch in the critical path`); }
+      return;
+    }
     const primary = pickSession(ctx);
     if (wafActive(primary)) return;
     ordersBusy = true;
@@ -1193,11 +1383,12 @@ async function main() {
 
     (async () => {
       await syncSapClock(sessions[0]);
-      const fireAtLocal = next - clock.offsetMs - fireLeadMs();
-      const csrfAt = fireAtLocal - CSRF_REMINT_LEAD_MS;
+      const fireAtLocal = next - clock.offsetMs - fireLeadMs();          // dispatch at boundary; fireItem holds the probe itself
+      const csrfAt = firstProbeLocalMs(next) - CSRF_REMINT_LEAD_MS;      // token minted just before the first probe
       const now = Date.now();
+      log.info(`   ↳ plan: dispatch @${new Date(fireAtLocal).toISOString().slice(11, 23)} local, CSRF @${new Date(csrfAt).toISOString().slice(11, 23)}, first captcha probe arrives boundary+${clock.unlockLagMs + UNLOCK_MARGIN_MS}ms (sessions phased ${sessions.length > 1 ? Math.round(clock.rttMs / sessions.length) : 0}ms apart)`);
       setTimeout(() => {
-        log.info(`🔑 CSRF re-mint on ${sessions.length} session(s) @ T-${(next - clock.offsetMs - Date.now())}ms`);
+        log.info(`🔑 CSRF re-mint on ${sessions.length} session(s) @ T${(Date.now() + clock.offsetMs - next) >= 0 ? '+' : ''}${Date.now() + clock.offsetMs - next}ms`);
         for (const s of sessions) s.refreshToken().catch((e) => log.warn(`[${s.id}] CSRF re-mint failed: ${e.message}`));
       }, Math.max(0, csrfAt - now));
       setTimeout(() => {
@@ -1211,7 +1402,7 @@ async function main() {
         // Orders already visible → fire now (captcha loop waits for unlock itself).
         // Else: arm one captcha per session AND fetch orders back-to-back in parallel.
         if (ctx.cachedOrders && ctx.cachedOrders.length && dispatchOrders(ctx, ctx.cachedOrders, 'boundary')) return;
-        for (const s of sessions) armCaptcha(s);
+        for (const s of sessions) armCaptcha(ctx, s, next);
         boundaryOrdersLoop(ctx).catch((e) => log.warn(`boundary loop failed: ${e.message}`));
       }, Math.max(0, fireAtLocal - now));
     })().catch((e) => log.error(`boundary scheduler failed: ${e.message}`));

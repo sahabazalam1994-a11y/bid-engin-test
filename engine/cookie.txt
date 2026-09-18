@@ -1,0 +1,1 @@
+SAP_SESSIONID=mock-s1; sess_map=abc

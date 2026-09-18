@@ -21,6 +21,7 @@ const OPEN_MS = parseInt(process.env.MOCK_OPEN_MS || '30000', 10);
 const CAPTCHA_UNLOCK_DELAY_MS = parseInt(process.env.MOCK_CAPTCHA_UNLOCK_DELAY_MS || '0', 10);
 const UNKNOWN_RATE = parseFloat(process.env.MOCK_UNKNOWN_RATE || '0');
 const WAF_BURST = parseInt(process.env.MOCK_WAF_BURST || '0', 10); // >N submits within 300ms → 406
+const WAF_DATE_SKEW_MS = parseInt(process.env.MOCK_WAF_DATE_SKEW_MS || '0', 10); // Date header (WAF clock) vs backend clock
 const WINDOW_MINUTES = (process.env.WINDOW_MINUTES || '15,45').split(',').map(Number);
 const PFX = '/sap/opu/odata/sap/ZVC_TRANSPORTER_SRV';
 const IST = 5.5 * 3_600_000;
@@ -63,8 +64,16 @@ function sess(req) {
   return sessions.get(c);
 }
 function send(res, code, body, extra = {}) {
-  const headers = { 'content-type': 'application/json', date: new Date(sapNow()).toUTCString(), connection: 'keep-alive', ...extra };
+  const headers = { 'content-type': 'application/json', date: new Date(sapNow() + WAF_DATE_SKEW_MS).toUTCString(), connection: 'keep-alive', ...extra };
   setTimeout(() => { res.writeHead(code, headers); res.end(typeof body === 'string' ? body : JSON.stringify(body)); }, LATENCY_MS);
+}
+// SAP Gateway error XML with backend timestamp (UTC, µs) — taken at processing time
+function gatewayNotFound(res) {
+  const d = new Date(sapNow() + LATENCY_MS / 2);
+  const p = (n, w = 2) => String(n).padStart(w, '0');
+  const ts = `${d.getUTCFullYear()}${p(d.getUTCMonth() + 1)}${p(d.getUTCDate())}${p(d.getUTCHours())}${p(d.getUTCMinutes())}${p(d.getUTCSeconds())}.${p(d.getUTCMilliseconds(), 3)}0000`;
+  stats.clockProbes = (stats.clockProbes || 0) + 1;
+  send(res, 404, `<?xml version="1.0" encoding="utf-8"?><error xmlns="http://schemas.microsoft.com/ado/2007/08/dataservices/metadata"><code>005056A509B11ED199D8826D151F80FE</code><message xml:lang="en">The server has not found any resource matching the Data Services Request URI</message><innererror><transactionid>A26ED41FECD80230E006A8114348757E</transactionid><timestamp>${ts}</timestamp></innererror></error>`, { 'content-type': 'application/xml' });
 }
 function readBody(req) { return new Promise((r) => { let s = ''; req.on('data', (c) => (s += c)); req.on('end', () => r(s)); }); }
 
@@ -74,7 +83,7 @@ const server = http.createServer(async (req, res) => {
   const win = lastBoundary(sapNow());
   if (win !== lastWinKey) { lastWinKey = win; stats.boundaries.push({ sapBoundary: win, localBoundary: win - CLOCK_OFFSET_MS }); }
 
-  if (url === '/mock/stats') return send(res, 200, { ...stats, clockOffsetMs: CLOCK_OFFSET_MS, windowOpen: windowOpen(), sapNow: sapNow(), sessions: sessions.size }, { date: new Date().toUTCString() });
+  if (url === '/mock/stats') return send(res, 200, { ...stats, clockOffsetMs: CLOCK_OFFSET_MS, wafDateSkewMs: WAF_DATE_SKEW_MS, captchaUnlockDelayMs: CAPTCHA_UNLOCK_DELAY_MS, windowOpen: windowOpen(), sapNow: sapNow(), sessions: sessions.size }, { date: new Date().toUTCString() });
   if (url === '/mock/reset') { stats.saves = []; stats.wrongCaptcha = 0; return send(res, 200, { ok: true }); }
 
   if (url.startsWith(`${PFX}/SessionSet`)) {
@@ -99,6 +108,11 @@ const server = http.createServer(async (req, res) => {
     const img = unknown ? unknownImages[Math.floor(Math.random() * unknownImages.length)] : images[Math.floor(Math.random() * images.length)];
     s.activeCaptcha = img; s.activeAnswer = unknown ? null : answers.get(img);
     stats.captchaIssued++;
+    if (stats.lastIssueWin !== win) {
+      stats.lastIssueWin = win;
+      const unlockLocal = (win - CLOCK_OFFSET_MS) + CAPTCHA_UNLOCK_DELAY_MS;
+      (stats.unlockDetect = stats.unlockDetect || []).push({ window: win, detectMs: Date.now() - unlockLocal, session: s.id });
+    }
     return send(res, 200, { d: { ImageString: img } });
   }
   if (url.startsWith(`${PFX}/EBiddingSaveSet`)) {
@@ -127,6 +141,7 @@ const server = http.createServer(async (req, res) => {
     }
     return send(res, 201, msg('S', 'Bidding Amount Saved Successfully.'));
   }
+  if (url.startsWith(`${PFX}/`)) return gatewayNotFound(res);
   send(res, 404, { error: 'not found', url });
 });
 

@@ -23,7 +23,7 @@ function ensureTestFixtures() {
   fs.writeFileSync(path.join(files, 'priority.csv'), 'Vbeln\n1150000002\n');
   fs.writeFileSync(path.join(ROOT, 'cookie.txt'), 'SAP_SESSIONID=mock-s1; sess_map=abc');
   fs.writeFileSync(path.join(ROOT, 'cookie2.txt'), 'SAP_SESSIONID=mock-s2; sess_map=def');
-  for (const f of ['token.txt', 'token2.txt']) { try { fs.unlinkSync(path.join(ROOT, f)); } catch (_) { /* ignore */ } }
+  for (const f of ['token.txt', 'token2.txt', 'captcha-bad.json', 'logs/clock-state.json']) { try { fs.unlinkSync(path.join(ROOT, f)); } catch (_) { /* ignore */ } }
 }
 
 const get = (p) => new Promise((resolve, reject) => http.get({ host: '127.0.0.1', port: PORT, path: p }, (r) => { let s = ''; r.on('data', (c) => (s += c)); r.on('end', () => resolve(JSON.parse(s))); }).on('error', reject));
@@ -46,11 +46,12 @@ async function main() {
   };
   const engine = spawn('node', ['bid-engine.js'], { cwd: ROOT, env: engineEnv, stdio: ['ignore', 'inherit', 'inherit'] });
 
-  // Wait until the next minute boundary + 12s
+  // Wait until the next minute boundary + 12s (optionally more windows so learned unlock-lag kicks in)
+  const windows = parseInt(process.env.E2E_WINDOWS || '1', 10);
   const now = Date.now();
   const nextMin = now - (now % 60_000) + 60_000;
-  const waitMs = nextMin - now + 12_000 + (nextMin - now < 25_000 ? 60_000 : 0); // need ≥25s of pre-warm
-  console.log(`[e2e] waiting ${(waitMs / 1000).toFixed(0)}s for window + settle…`);
+  const waitMs = nextMin - now + 12_000 + (nextMin - now < 25_000 ? 60_000 : 0) + (windows - 1) * 60_000;
+  console.log(`[e2e] waiting ${(waitMs / 1000).toFixed(0)}s for ${windows} window(s) + settle…`);
   await sleep(waitMs);
 
   const st = await get('/mock/stats');
@@ -67,7 +68,7 @@ async function main() {
   check('at least one bid saved', okSaves.length >= 1, `${okSaves.length} ok saves, ${st.wrongCaptcha} wrong-captcha`);
   check('priority order (9000000002) saved first', first && first.sapOrderId === '9000000002', first ? `first=${first.sapOrderId}` : 'none');
   check('blacklisted order (9000000003) never bid', !st.saves.some((s) => s.sapOrderId === '9000000003'));
-  const maxFirst = parseInt(process.env.E2E_MAX_FIRST_MS || '400', 10);
+  const maxFirst = parseInt(process.env.E2E_MAX_FIRST_MS || String(400 + parseInt(process.env.MOCK_CAPTCHA_UNLOCK_DELAY_MS || '0', 10)), 10);
   check('first save within ' + maxFirst + 'ms of SAP boundary', first && first.fromBoundaryMs >= -50 && first.fromBoundaryMs <= maxFirst, first ? `${first.fromBoundaryMs}ms after boundary (mock skew +${st.clockOffsetMs}ms)` : 'none');
   check('captcha lookup correct (no wrong-captcha before first success)', process.env.MOCK_UNKNOWN_RATE ? true : !st.saves.some((s) => !s.ok && first && s.at < first.at), `wrong=${st.wrongCaptcha}`);
   check('MUMBAI order saved at 1234', okSaves.some((s) => s.sapOrderId === '9000000001' && s.amount === '1234.000') || st.waf406 > 0, st.waf406 > 0 && !okSaves.some((s) => s.sapOrderId === '9000000001') ? 'skipped: mock WAF blocked all sessions for the remainder of the window (expected back-off)' : '');
@@ -75,6 +76,16 @@ async function main() {
   check('no CSRF failures', st.csrfFail === 0, `csrfFail=${st.csrfFail}`);
   check('captcha fetched only during/after unlock (no pre-boundary rotation)', st.captchaIssued <= okSaves.length + st.wrongCaptcha + 4 + (process.env.MOCK_UNKNOWN_RATE ? 20 : 0), `issued=${st.captchaIssued} empty=${st.captchaEmpty}`);
   if (process.env.MOCK_WAF_BURST) check('WAF 406 respected (engine backed off, saves still landed)', st.waf406 >= 1 && okSaves.length >= 1, `waf406=${st.waf406}`);
+  if (windows > 1) {
+    // Last window: learned unlock lag should make the first probe land right after unlock.
+    const lastWin = Math.max(...(st.unlockDetect || []).map((u) => u.window));
+    const det = (st.unlockDetect || []).find((u) => u.window === lastWin);
+    const lastAligned = aligned.filter((s) => s.at > lastWin - st.clockOffsetMs).sort((a, b) => a.at - b.at)[0];
+    const rtt = 2 * parseInt(process.env.MOCK_LATENCY_MS || '20', 10);
+    check('learned unlock-lag: probe detects unlock within RTT+margin in last window', det && det.detectMs >= -5 && det.detectMs <= rtt + 60, det ? `detect=${det.detectMs}ms after unlock (rtt ${rtt}ms)` : 'no detect');
+    check('learned unlock-lag: first save ≤ unlock + 2.5×RTT in last window', lastAligned && lastAligned.fromBoundaryMs <= st.captchaUnlockDelayMs + 2.5 * rtt + 40, lastAligned ? `${lastAligned.fromBoundaryMs}ms from boundary (unlock delay ${st.captchaUnlockDelayMs}ms)` : 'none');
+    console.log('[e2e] unlock detections per window:', JSON.stringify(st.unlockDetect));
+  }
 
   const passed = results.filter((r) => r.pass).length;
   console.log(`\n[e2e] ${passed}/${results.length} checks passed`);
