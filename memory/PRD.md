@@ -29,6 +29,16 @@ after window open; all vendors bid the same amount → pure latency race. Phases
   hard mode (30% unknown captcha, WAF burst, 800ms unlock delay) 10/10.
 - Testing agent iteration_1: engine clean; 2 test-harness determinism fixes applied.
 
+## Implemented v4.1 (2026-09-18) — from 3 days of live logs
+- Live evidence: captcha unlocks ~1.0s after Date-header boundary; serial probe granularity ~170ms → mostly 'tied';
+  12 map answers rejected (OCR-polluted data.json); BidOrderListSet 2.7-3.7s at boundary.
+- Backend (ABAP) clock sync via Gateway error XML <timestamp> (CLOCK_SOURCE=backend), Date-header kept as fallback/diag.
+- Learned unlock lag (logs/unlock-lag-*.csv, logs/clock-state.json), first probe aimed to ARRIVE at boundary+lag+15ms,
+  sessions phased RTT/N; observations only from bracketed/aimed probes, capped 5s (catch-up fires ignored).
+- captcha-bad.json persistence + logs/wrong-captcha/*.png; optional CAPTCHA_FALLBACK_URL with auto-learn into data.json.
+- ORDERS_FREEZE_MS=1500 (no order fetch in critical path when plan ready). SESSION_STAGGER_MS default 0.
+- Mock: gateway 404 XML timestamp, MOCK_WAF_DATE_SKEW_MS, unlockDetect stats; e2e E2E_WINDOWS + lag checks (11/11).
+
 ## Backlog
 - P1: User runs `tools/region-probe.js` on VPS; move to AWS ap-south-1 if TTFB p50 > 15ms; run `vps-tune.sh`.
 - P1: First live windows: read `logs/fire-timing-*.csv`, tune FIRE_LEAD_MS / CSRF_REMINT_LEAD_MS / SESSION_STAGGER_MS.

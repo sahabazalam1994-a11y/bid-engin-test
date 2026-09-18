@@ -20,3 +20,34 @@ timestamp,session,sap_order_id,city,spi,csv_rate,submit_ms,status,message
 2026-09-18T07:33:59.655Z,s2,9000000002,PUNE - STO,(any),999,71,ACCEPTED,rank=1 L1=999.000 | Bidding Amount Saved Successfully.
 2026-09-18T07:33:59.719Z,s1,9000000002,PUNE - STO,(any),999,71,ACCEPTED,rank=1 L1=999.000 | Bidding Amount Saved Successfully.
 2026-09-18T07:33:59.859Z,s1,9000000001,MUMBAI,1164,1234,70,ACCEPTED,rank=1 L1=1234.000 | Bidding Amount Saved Successfully.
+2026-09-18T07:35:59.723Z,s1,9000000002,PUNE - STO,(any),999,71,ACCEPTED,rank=1 L1=999.000 | Bidding Amount Saved Successfully.
+2026-09-18T07:35:59.724Z,s2,9000000002,PUNE - STO,(any),999,71,ACCEPTED,rank=1 L1=999.000 | Bidding Amount Saved Successfully.
+2026-09-18T07:35:59.866Z,s1,9000000001,MUMBAI,1164,1234,71,ACCEPTED,rank=1 L1=1234.000 | Bidding Amount Saved Successfully.
+2026-09-18T07:36:59.686Z,s1,9000000002,PUNE - STO,(any),999,71,ACCEPTED,rank=1 L1=999.000 | Bidding Amount Saved Successfully.
+2026-09-18T07:36:59.721Z,s2,9000000002,PUNE - STO,(any),999,70,ACCEPTED,rank=1 L1=999.000 | Bidding Amount Saved Successfully.
+2026-09-18T07:36:59.828Z,s1,9000000001,MUMBAI,1164,1234,71,ACCEPTED,rank=1 L1=1234.000 | Bidding Amount Saved Successfully.
+2026-09-18T07:37:59.676Z,s1,9000000002,PUNE - STO,(any),999,70,ACCEPTED,rank=1 L1=999.000 | Bidding Amount Saved Successfully.
+2026-09-18T07:37:59.711Z,s2,9000000002,PUNE - STO,(any),999,71,ACCEPTED,rank=1 L1=999.000 | Bidding Amount Saved Successfully.
+2026-09-18T07:37:59.818Z,s1,9000000001,MUMBAI,1164,1234,70,ACCEPTED,rank=1 L1=1234.000 | Bidding Amount Saved Successfully.
+2026-09-18T07:39:24.816Z,s1,9000000002,PUNE - STO,(any),999,21,ACCEPTED,rank=1 L1=999.000 | Bidding Amount Saved Successfully.
+2026-09-18T07:39:24.818Z,s2,9000000002,PUNE - STO,(any),999,22,ACCEPTED,rank=1 L1=999.000 | Bidding Amount Saved Successfully.
+2026-09-18T07:39:24.857Z,s1,9000000001,MUMBAI,1164,1234,21,ACCEPTED,rank=1 L1=1234.000 | Bidding Amount Saved Successfully.
+2026-09-18T07:42:13.631Z,s2,9000000002,PUNE - STO,(any),999,21,ACCEPTED,rank=1 L1=999.000 | Bidding Amount Saved Successfully.
+2026-09-18T08:05:58.570Z,s1,9000000002,PUNE - STO,(any),999,21,ACCEPTED,rank=1 L1=999.000 | Bidding Amount Saved Successfully.
+2026-09-18T08:05:58.572Z,s2,9000000002,PUNE - STO,(any),999,23,ACCEPTED,rank=1 L1=999.000 | Bidding Amount Saved Successfully.
+2026-09-18T08:05:58.612Z,s1,9000000001,MUMBAI,1164,1234,20,ACCEPTED,rank=1 L1=1234.000 | Bidding Amount Saved Successfully.
+2026-09-18T08:06:58.565Z,s1,9000000002,PUNE - STO,(any),999,21,ACCEPTED,rank=1 L1=999.000 | Bidding Amount Saved Successfully.
+2026-09-18T08:06:58.566Z,s2,9000000002,PUNE - STO,(any),999,22,ACCEPTED,rank=1 L1=999.000 | Bidding Amount Saved Successfully.
+2026-09-18T08:06:58.608Z,s1,9000000001,MUMBAI,1164,1234,21,ACCEPTED,rank=1 L1=1234.000 | Bidding Amount Saved Successfully.
+2026-09-18T08:07:13.645Z,s1,9000000002,PUNE - STO,(any),999,22,ACCEPTED,rank=1 L1=999.000 | Bidding Amount Saved Successfully.
+2026-09-18T08:10:59.385Z,s1,9000000002,PUNE - STO,(any),999,20,ACCEPTED,rank=1 L1=999.000 | Bidding Amount Saved Successfully.
+2026-09-18T08:11:59.345Z,s1,9000000002,PUNE - STO,(any),999,21,ACCEPTED,rank=1 L1=999.000 | Bidding Amount Saved Successfully.
+2026-09-18T08:12:13.872Z,s1,9000000002,PUNE - STO,(any),999,73,ACCEPTED,rank=1 L1=999.000 | Bidding Amount Saved Successfully.
+2026-09-18T08:12:13.873Z,s2,9000000002,PUNE - STO,(any),999,75,ACCEPTED,rank=1 L1=999.000 | Bidding Amount Saved Successfully.
+2026-09-18T08:12:14.015Z,s1,9000000001,MUMBAI,1164,1234,71,ACCEPTED,rank=1 L1=1234.000 | Bidding Amount Saved Successfully.
+2026-09-18T08:12:59.727Z,s1,9000000002,PUNE - STO,(any),999,70,ACCEPTED,rank=1 L1=999.000 | Bidding Amount Saved Successfully.
+2026-09-18T08:12:59.739Z,s2,9000000002,PUNE - STO,(any),999,70,ACCEPTED,rank=1 L1=999.000 | Bidding Amount Saved Successfully.
+2026-09-18T08:12:59.870Z,s1,9000000001,MUMBAI,1164,1234,71,ACCEPTED,rank=1 L1=1234.000 | Bidding Amount Saved Successfully.
+2026-09-18T08:13:59.694Z,s1,9000000002,PUNE - STO,(any),999,71,ACCEPTED,rank=1 L1=999.000 | Bidding Amount Saved Successfully.
+2026-09-18T08:13:59.727Z,s2,9000000002,PUNE - STO,(any),999,71,ACCEPTED,rank=1 L1=999.000 | Bidding Amount Saved Successfully.
+2026-09-18T08:13:59.835Z,s1,9000000001,MUMBAI,1164,1234,70,ACCEPTED,rank=1 L1=1234.000 | Bidding Amount Saved Successfully.

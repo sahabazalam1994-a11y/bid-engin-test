@@ -3,7 +3,7 @@
     {
       "name": "at least one bid saved",
       "pass": true,
-      "detail": "12 ok saves, 0 wrong-captcha"
+      "detail": "9 ok saves, 0 wrong-captcha"
     },
     {
       "name": "priority order (9000000002) saved first",
@@ -17,7 +17,7 @@
     {
       "name": "first save within 1400ms of SAP boundary",
       "pass": true,
-      "detail": "1084ms after boundary (mock skew +1500ms)"
+      "detail": "1156ms after boundary (mock skew +1500ms)"
     },
     {
       "name": "captcha lookup correct (no wrong-captcha before first success)",
@@ -41,201 +41,158 @@
     {
       "name": "captcha fetched only during/after unlock (no pre-boundary rotation)",
       "pass": true,
-      "detail": "issued=12 empty=24"
+      "detail": "issued=9 empty=22"
     },
     {
       "name": "learned unlock-lag: probe detects unlock within RTT+margin in last window",
       "pass": true,
-      "detail": "detect=12ms after unlock (rtt 140ms)"
+      "detail": "detect=50ms after unlock (rtt 140ms)"
     },
     {
       "name": "learned unlock-lag: first save ≤ unlock + 2.5×RTT in last window",
       "pass": true,
-      "detail": "1084ms from boundary (unlock delay 1000ms)"
+      "detail": "1122ms from boundary (unlock delay 1000ms)"
     }
   ],
   "stats": {
     "boundaries": [
       {
-        "sapBoundary": 1789716600000,
-        "localBoundary": 1789716598500
+        "sapBoundary": 1789719120000,
+        "localBoundary": 1789719118500
       },
       {
-        "sapBoundary": 1789716660000,
-        "localBoundary": 1789716658500
+        "sapBoundary": 1789719180000,
+        "localBoundary": 1789719178500
       },
       {
-        "sapBoundary": 1789716720000,
-        "localBoundary": 1789716718500
-      },
-      {
-        "sapBoundary": 1789716780000,
-        "localBoundary": 1789716778500
-      },
-      {
-        "sapBoundary": 1789716840000,
-        "localBoundary": 1789716838500
+        "sapBoundary": 1789719240000,
+        "localBoundary": 1789719238500
       }
     ],
-    "captchaFetches": 36,
-    "captchaEmpty": 24,
-    "captchaIssued": 12,
+    "captchaFetches": 31,
+    "captchaEmpty": 22,
+    "captchaIssued": 9,
     "saves": [
       {
         "ok": true,
-        "at": 1789716659584,
+        "at": 1789719133799,
         "sapOrderId": "9000000002",
         "amount": "999.000",
         "rank": 1,
-        "fromBoundaryMs": 1084,
-        "session": "c2",
-        "captcha": "08ea8"
+        "fromBoundaryMs": 15299,
+        "session": "c1",
+        "captcha": "d0aad"
       },
       {
         "ok": true,
-        "at": 1789716659636,
+        "at": 1789719133800,
         "sapOrderId": "9000000002",
         "amount": "999.000",
         "rank": 2,
-        "fromBoundaryMs": 1136,
-        "session": "c1",
-        "captcha": "5543b"
+        "fromBoundaryMs": 15300,
+        "session": "c2",
+        "captcha": "07adb"
       },
       {
         "ok": true,
-        "at": 1789716659777,
+        "at": 1789719133944,
         "sapOrderId": "9000000001",
         "amount": "1234.000",
         "rank": 1,
-        "fromBoundaryMs": 1277,
+        "fromBoundaryMs": 15444,
         "session": "c1",
-        "captcha": "5543b"
+        "captcha": "c0321"
       },
       {
         "ok": true,
-        "at": 1789716719583,
+        "at": 1789719179656,
         "sapOrderId": "9000000002",
         "amount": "999.000",
         "rank": 3,
-        "fromBoundaryMs": 1083,
-        "session": "c2",
-        "captcha": "437be"
+        "fromBoundaryMs": 1156,
+        "session": "c1",
+        "captcha": "6edf9"
       },
       {
         "ok": true,
-        "at": 1789716719645,
+        "at": 1789719179668,
         "sapOrderId": "9000000002",
         "amount": "999.000",
         "rank": 4,
-        "fromBoundaryMs": 1145,
-        "session": "c1",
-        "captcha": "6c405"
+        "fromBoundaryMs": 1168,
+        "session": "c2",
+        "captcha": "f6466"
       },
       {
         "ok": true,
-        "at": 1789716719787,
+        "at": 1789719179798,
         "sapOrderId": "9000000001",
         "amount": "1234.000",
         "rank": 2,
-        "fromBoundaryMs": 1287,
+        "fromBoundaryMs": 1298,
         "session": "c1",
-        "captcha": "bc940"
+        "captcha": "d0aad"
       },
       {
         "ok": true,
-        "at": 1789716779583,
+        "at": 1789719239622,
         "sapOrderId": "9000000002",
         "amount": "999.000",
         "rank": 5,
-        "fromBoundaryMs": 1083,
-        "session": "c2",
-        "captcha": "437be"
+        "fromBoundaryMs": 1122,
+        "session": "c1",
+        "captcha": "15c9c"
       },
       {
         "ok": true,
-        "at": 1789716779648,
+        "at": 1789719239656,
         "sapOrderId": "9000000002",
         "amount": "999.000",
         "rank": 6,
-        "fromBoundaryMs": 1148,
-        "session": "c1",
-        "captcha": "da9bb"
+        "fromBoundaryMs": 1156,
+        "session": "c2",
+        "captcha": "7f8e7"
       },
       {
         "ok": true,
-        "at": 1789716779790,
+        "at": 1789719239765,
         "sapOrderId": "9000000001",
         "amount": "1234.000",
         "rank": 3,
-        "fromBoundaryMs": 1290,
+        "fromBoundaryMs": 1265,
         "session": "c1",
-        "captcha": "af0c8"
-      },
-      {
-        "ok": true,
-        "at": 1789716839584,
-        "sapOrderId": "9000000002",
-        "amount": "999.000",
-        "rank": 7,
-        "fromBoundaryMs": 1084,
-        "session": "c2",
-        "captcha": "08ea8"
-      },
-      {
-        "ok": true,
-        "at": 1789716839648,
-        "sapOrderId": "9000000002",
-        "amount": "999.000",
-        "rank": 8,
-        "fromBoundaryMs": 1148,
-        "session": "c1",
-        "captcha": "5393c"
-      },
-      {
-        "ok": true,
-        "at": 1789716839789,
-        "sapOrderId": "9000000001",
-        "amount": "1234.000",
-        "rank": 4,
-        "fromBoundaryMs": 1289,
-        "session": "c1",
-        "captcha": "da9bb"
+        "captcha": "30d4e"
       }
     ],
     "wrongCaptcha": 0,
     "csrfFail": 0,
     "waf406": 0,
-    "sessionSetCalls": 258,
-    "orderListCalls": 1394,
-    "clockProbes": 36,
-    "lastIssueWin": 1789716840000,
+    "sessionSetCalls": 140,
+    "orderListCalls": 805,
+    "lastIssueWin": 1789719240000,
     "unlockDetect": [
       {
-        "window": 1789716660000,
-        "detectMs": 13,
-        "session": "c2"
+        "window": 1789719120000,
+        "detectMs": 14226,
+        "session": "c1"
       },
       {
-        "window": 1789716720000,
-        "detectMs": 12,
-        "session": "c2"
+        "window": 1789719180000,
+        "detectMs": 84,
+        "session": "c1"
       },
       {
-        "window": 1789716780000,
-        "detectMs": 12,
-        "session": "c2"
-      },
-      {
-        "window": 1789716840000,
-        "detectMs": 12,
-        "session": "c2"
+        "window": 1789719240000,
+        "detectMs": 50,
+        "session": "c1"
       }
     ],
+    "clockProbes": 18,
     "clockOffsetMs": 1500,
     "wafDateSkewMs": -900,
     "captchaUnlockDelayMs": 1000,
     "windowOpen": true,
-    "sapNow": 1789716853606,
+    "sapNow": 1789719253604,
     "sessions": 3
   }
 }

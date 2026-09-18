@@ -78,6 +78,7 @@ const CLOCK_SYNC_INTERVAL_MS  = envInt('CLOCK_SYNC_INTERVAL_MS', 100);
 const SAP_CLOCK_OFFSET_MS     = process.env.SAP_CLOCK_OFFSET_MS !== undefined ? parseInt(process.env.SAP_CLOCK_OFFSET_MS, 10) : null;
 const UNLOCK_LAG_MS           = envInt('UNLOCK_LAG_MS', -1);            // -1 = learn from live windows
 const UNLOCK_MARGIN_MS        = envInt('UNLOCK_MARGIN_MS', 15);          // aim first probe this far after unlock
+const UNLOCK_LAG_MAX_MS       = envInt('UNLOCK_LAG_MAX_MS', 5000);       // sanity cap for learned lag
 const ORDERS_FREEZE_MS        = envInt('ORDERS_FREEZE_MS', 1500);        // stop order fetches this close to boundary when plan is ready
 const CAPTCHA_FALLBACK_URL    = process.env.CAPTCHA_FALLBACK_URL || '';   // optional legacy solver for unknown/bad hashes
 
@@ -329,17 +330,22 @@ function recomputeUnlockLag() {
   const s = clock.unlockLagSamples.filter((v) => Number.isFinite(v) && v > -2000 && v < 30000).sort((a, b) => a - b);
   if (!s.length) { clock.unlockLagMs = 0; return; }
   // measured lag = true lag + detection delay (0..RTT) → the low quantile is closest to truth
-  clock.unlockLagMs = Math.max(0, s[Math.floor(s.length * 0.2)]);
+  clock.unlockLagMs = Math.min(UNLOCK_LAG_MAX_MS, Math.max(0, s[Math.floor(s.length * 0.2)]));
 }
 // Called with the local send time of the first probe that returned a captcha, plus
 // (if any) the send time of the last EMPTY probe before it → unlock ∈ (empty, hit].
-function noteUnlock(winKey, tReqLocal, tRespLocal, sid, lastEmptyReqLocal = 0) {
+function noteUnlock(winKey, tReqLocal, tRespLocal, sid, lastEmptyReqLocal = 0, aimed = false) {
   if (clock.unlockNotedWin === winKey) return;
-  clock.unlockNotedWin = winKey;
+  if (!clock.synced || clock.source === 'none') return;
   const hitProc = tReqLocal + oneWayMs() + clock.offsetMs;   // SAP time when the hit probe was processed
   const hitLag = Math.round(hitProc - winKey);
+  const bracketed = lastEmptyReqLocal && tReqLocal - lastEmptyReqLocal < 2 * clock.rttMs + 200;
+  // Only a probe that actually saw the transition counts: bracketed by an empty probe, or the
+  // aimed first probe of the window. A catch-up fire mid-window is NOT an unlock observation.
+  if ((!bracketed && !aimed) || hitLag < -500 || hitLag > UNLOCK_LAG_MAX_MS) return;
+  clock.unlockNotedWin = winKey;
   let lag;
-  if (lastEmptyReqLocal && tReqLocal - lastEmptyReqLocal < 2 * clock.rttMs + 200) {
+  if (bracketed) {
     const emptyLag = Math.round(lastEmptyReqLocal + oneWayMs() + clock.offsetMs - winKey);
     lag = Math.round((emptyLag + hitLag) / 2);                // bracketed → midpoint
   } else {
@@ -350,7 +356,7 @@ function noteUnlock(winKey, tReqLocal, tRespLocal, sid, lastEmptyReqLocal = 0) {
   const before = clock.unlockLagMs;
   recomputeUnlockLag();
   unlockLog.write([new Date().toISOString(), istHHMM(winKey), sid, winKey, tReqLocal, tRespLocal, clock.offsetMs, clock.rttMs, hitLag, clock.unlockLagMs]);
-  log.info(`🔓 captcha UNLOCK observed at boundary+${hitLag}ms (SAP ${clock.source} clock${lastEmptyReqLocal ? ', bracketed' : ', first probe already open'}) — learned lag ${before}→${clock.unlockLagMs}ms (${clock.unlockLagSamples.length} samples)`);
+  log.info(`🔓 captcha UNLOCK observed at boundary+${hitLag}ms (SAP ${clock.source} clock${bracketed ? ', bracketed' : ', aimed probe already open'}) — learned lag ${before}→${clock.unlockLagMs}ms (${clock.unlockLagSamples.length} samples)`);
   saveClockState();
 }
 // Local instant at which session #idx should SEND its first captcha probe so it
@@ -994,9 +1000,11 @@ async function fireItem(ctx, auth, item, race = null) {
       log.info(`[${sid}] ⚡ using armed captcha (fetched ${Date.now() - armed.at}ms ago, in parallel with orders)`);
     } else {
       // First probe of the window: wait so it ARRIVES at SAP at boundary + learned unlock lag + margin.
+      let aimed = false;
       if (emptyCount === 0 && !lastCaptchaHash) {
         const idx = Math.max(0, ctx.sessions.indexOf(auth));
         const wait = firstProbeLocalMs(winKey, idx, ctx.sessions.length) - Date.now();
+        if (wait > -50 && wait < 120_000) aimed = true;
         if (wait > 0 && wait < 120_000) { log.info(`[${sid}] ⏲  holding first probe ${wait}ms → arrives boundary+${clock.unlockLagMs + UNLOCK_MARGIN_MS}ms (lag ${clock.unlockLagMs} + margin ${UNLOCK_MARGIN_MS}, phase ${idx}/${ctx.sessions.length})`); await sleep(wait); }
       }
       tCapReq = Date.now();
@@ -1016,7 +1024,7 @@ async function fireItem(ctx, auth, item, race = null) {
         await sleep(150 + jitter(50));
         continue;
       }
-      noteUnlock(winKey, tCapReq, tCapResp, sid, lastEmptyReq);
+      noteUnlock(winKey, tCapReq, tCapResp, sid, lastEmptyReq, aimed);
       const lk = lookupCaptcha(img);
       lastCaptchaHash = lk.hash; lastCaptchaRaw = lk.raw; solvedSource = 'map';
       if (!lk.solved) {
@@ -1172,12 +1180,13 @@ function armCaptcha(ctx, auth, winKey) {
     let lastEmptyReq = 0;
     const idx = Math.max(0, ctx.sessions.indexOf(auth));
     const hold = firstProbeLocalMs(winKey, idx, ctx.sessions.length) - Date.now();
+    const aimed = hold > -50;
     if (hold > 0 && hold < 120_000) await sleep(hold);
     while (Date.now() - start < FIRE_MAX_WAIT_MS && !wafActive(auth) && !auth.mutex._busy) {
       const t0 = Date.now();
       const { img, reason } = await fetchCaptchaImage(auth);
       if (img) {
-        noteUnlock(winKey, t0, Date.now(), auth.id, lastEmptyReq);
+        noteUnlock(winKey, t0, Date.now(), auth.id, lastEmptyReq, aimed);
         const lk = lookupCaptcha(img);
         let source = 'map';
         if (!lk.solved) { lk.solved = await fallbackSolve(lk.raw); source = 'fallback'; }
