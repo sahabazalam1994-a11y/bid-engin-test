@@ -39,6 +39,13 @@ after window open; all vendors bid the same amount → pure latency race. Phases
 - ORDERS_FREEZE_MS=1500 (no order fetch in critical path when plan ready). SESSION_STAGGER_MS default 0.
 - Mock: gateway 404 XML timestamp, MOCK_WAF_DATE_SKEW_MS, unlockDetect stats; e2e E2E_WINDOWS + lag checks (11/11).
 
+## Implemented v4.2 (user request) — STRIKE_MODE
+- `timed` (default per user): after unlock detect → STRIKE_PARALLEL=3 fetchers for STRIKE_WARM_MS=3000 (no save) → final fetch
+  timed so save arrives at unlock+STRIKE_SAVE_AT_MS=4000; once per session per window (STRIKE_PER_ITEM to change);
+  mid-window new matched orders (10→12) trigger the same. `instant` = v4.1 path. `ab` = alternate per window.
+- e2e timed scenario 11/11 (save at unlock+4055ms, 102 warm fetches/session, no early save); instant 9/9 regression.
+- Runner now evaluates the LAST window (catch-up saves at engine start were confusing checks).
+
 ## Backlog
 - P1: User runs `tools/region-probe.js` on VPS; move to AWS ap-south-1 if TTFB p50 > 15ms; run `vps-tune.sh`.
 - P1: First live windows: read `logs/fire-timing-*.csv`, tune FIRE_LEAD_MS / CSRF_REMINT_LEAD_MS / SESSION_STAGGER_MS.

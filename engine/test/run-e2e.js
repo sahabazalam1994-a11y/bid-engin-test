@@ -43,6 +43,7 @@ async function main() {
     CAPTCHA_MAP_FILE: 'test/captcha-map.test.json',
     HOT_POST_MS: '35000', HOT_PRE_MS: '20000', CLOCK_SYNC_LEAD_MS: '20000', CLOCK_SYNC_DURATION_MS: '5000',
     METRICS_INTERVAL_MS: '0', L1_UNDERCUT: 'false', LOG_LEVEL: process.env.LOG_LEVEL || 'info',
+    STRIKE_MODE: process.env.STRIKE_MODE || 'instant',
   };
   const engine = spawn('node', ['bid-engine.js'], { cwd: ROOT, env: engineEnv, stdio: ['ignore', 'inherit', 'inherit'] });
 
@@ -59,8 +60,10 @@ async function main() {
   setTimeout(() => { try { engine.kill('SIGKILL'); mock.kill('SIGKILL'); } catch (_) { /* gone */ } }, 1500).unref();
 
   const okSaves = st.saves.filter((s) => s.ok);
-  // Catch-up saves from an already-open window at engine start are correct behaviour but not boundary-aligned.
-  const aligned = okSaves.filter((s) => s.fromBoundaryMs < 15_000).sort((a, b) => a.at - b.at);
+  // Evaluate the LAST window (engine may have started mid-window and done a catch-up save earlier).
+  const winStart = (s) => Math.round((s.at - s.fromBoundaryMs) / 1000) * 1000;
+  const lastStart = okSaves.length ? Math.max(...okSaves.map(winStart)) : 0;
+  const aligned = okSaves.filter((s) => winStart(s) === lastStart).sort((a, b) => a.at - b.at);
   const first = aligned[0] || okSaves.sort((a, b) => a.at - b.at)[0];
   const results = [];
   const check = (name, cond, detail) => { results.push({ name, pass: !!cond, detail }); console.log(`${cond ? '✅' : '❌'} ${name}${detail ? ' — ' + detail : ''}`); };
@@ -68,13 +71,20 @@ async function main() {
   check('at least one bid saved', okSaves.length >= 1, `${okSaves.length} ok saves, ${st.wrongCaptcha} wrong-captcha`);
   check('priority order (9000000002) saved first', first && first.sapOrderId === '9000000002', first ? `first=${first.sapOrderId}` : 'none');
   check('blacklisted order (9000000003) never bid', !st.saves.some((s) => s.sapOrderId === '9000000003'));
-  const maxFirst = parseInt(process.env.E2E_MAX_FIRST_MS || String(400 + parseInt(process.env.MOCK_CAPTCHA_UNLOCK_DELAY_MS || '0', 10)), 10);
+  const timed = (process.env.STRIKE_MODE || 'instant') === 'timed';
+  const saveAt = parseInt(process.env.STRIKE_SAVE_AT_MS || '4000', 10);
+  const unlockDelay = parseInt(process.env.MOCK_CAPTCHA_UNLOCK_DELAY_MS || '0', 10);
+  const maxFirst = parseInt(process.env.E2E_MAX_FIRST_MS || String((timed ? saveAt + 700 : 400) + unlockDelay), 10);
   check('first save within ' + maxFirst + 'ms of SAP boundary', first && first.fromBoundaryMs >= -50 && first.fromBoundaryMs <= maxFirst, first ? `${first.fromBoundaryMs}ms after boundary (mock skew +${st.clockOffsetMs}ms)` : 'none');
+  if (timed) {
+    check(`timed strike: first save lands at unlock+${saveAt}ms (±400)`, first && Math.abs(first.fromBoundaryMs - unlockDelay - saveAt) <= 400, first ? `${first.fromBoundaryMs - unlockDelay}ms after unlock` : 'none');
+    check('timed strike: warm phase fetched many captchas without saving', st.captchaIssued >= 15 && st.saves.filter((s) => s.at < first.at).length === 0, `issued=${st.captchaIssued}`);
+  }
   check('captcha lookup correct (no wrong-captcha before first success)', process.env.MOCK_UNKNOWN_RATE ? true : !st.saves.some((s) => !s.ok && first && s.at < first.at), `wrong=${st.wrongCaptcha}`);
   check('MUMBAI order saved at 1234', okSaves.some((s) => s.sapOrderId === '9000000001' && s.amount === '1234.000') || st.waf406 > 0, st.waf406 > 0 && !okSaves.some((s) => s.sapOrderId === '9000000001') ? 'skipped: mock WAF blocked all sessions for the remainder of the window (expected back-off)' : '');
   check('PUNE order saved at 999', okSaves.some((s) => s.sapOrderId === '9000000002' && s.amount === '999.000'));
   check('no CSRF failures', st.csrfFail === 0, `csrfFail=${st.csrfFail}`);
-  check('captcha fetched only during/after unlock (no pre-boundary rotation)', st.captchaIssued <= okSaves.length + st.wrongCaptcha + 4 + (process.env.MOCK_UNKNOWN_RATE ? 20 : 0), `issued=${st.captchaIssued} empty=${st.captchaEmpty}`);
+  check('captcha fetched only during/after unlock (no pre-boundary rotation)', timed || st.captchaIssued <= okSaves.length + st.wrongCaptcha + 4 + (process.env.MOCK_UNKNOWN_RATE ? 20 : 0), `issued=${st.captchaIssued} empty=${st.captchaEmpty}`);
   if (process.env.MOCK_WAF_BURST) check('WAF 406 respected (engine backed off, saves still landed)', st.waf406 >= 1 && okSaves.length >= 1, `waf406=${st.waf406}`);
   if (windows > 1) {
     // Last window: learned unlock lag should make the first probe land right after unlock.

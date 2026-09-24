@@ -32,6 +32,15 @@ keep-alive connection, CSRF re-minted 300ms earlier, fired on **SAP's clock** (n
 
 Expected after 1–2 live windows: `🔓 captcha UNLOCK observed at boundary+~1000ms` → next window `⏲ holding first probe …` → first submit ≈ unlock + captcha RTT + ~20 ms (vs unlock + 85–170 ms before). **Add cookie2.txt / cookie3.txt** — each extra session halves the detection granularity.
 
+## v4.2 — Strike modes (`STRIKE_MODE`)
+| Mode | What happens after the captcha unlock is detected |
+|---|---|
+| `timed` (default, as requested) | Fetch captchas **in parallel** (`STRIKE_PARALLEL=3`) for `STRIKE_WARM_MS=3000` **without saving**, then ONE final fetch timed so the save **arrives at unlock + `STRIKE_SAVE_AT_MS=4000`**. Once per session per window (`STRIKE_PER_ITEM=true` → every dispatched item warms). Also applies when orders were not matched at open and new matched orders appear mid-window (10 → 12): the first fire on that session warms 3 s, saves at 4 s. |
+| `instant` | v4.1 behaviour: save with the first captcha after unlock (≈ unlock + 1 RTT). |
+| `ab` | Alternate `timed` / `instant` per window → compare ranks in `logs/bid-log-*.csv` to prove which wins. |
+
+Honest note: live logs show competitors' saves landing before ~1.4 s after the boundary (our `tied` results). `timed` saves at ~4 s; if SAP ranks by arrival, `instant` should win. Run `STRIKE_MODE=ab` for a day and let the bid-log decide.
+
 ## Files
 
 ```
