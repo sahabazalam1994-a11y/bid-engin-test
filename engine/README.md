@@ -49,7 +49,7 @@ logger.js                tiny logger (stdout + logs/engine-YYYY-MM-DD.log)
 data.json                162 captcha hashes → answers  (sha256 of the base64 string)
 cookie.txt, cookie2.txt… one SAP session per file (all same vendor)
 files/input2.csv, delete.csv, priority.csv
-.env.example             copy to .env
+example.env             copy to .env
 tools/region-probe.js    run on VPS: SAP hosting region, RTT/jitter, ALPN, clock offset
 tools/vps-tune.sh        chrony NTP + sysctl low-latency + BBR
 test/mock-sap.js         mock SAP with clock skew, rotating captcha, ranking
@@ -59,7 +59,7 @@ bid-engine.v3.35.backup.js, bidding.legacy.js   old code, not used
 
 ## Run
 ```bash
-cp .env.example .env         # edit VENDOR_ID / PLANT_CODE if needed
+cp example.env .env         # edit VENDOR_ID / PLANT_CODE if needed
 yarn install                 # or npm i
 node tools/region-probe.js   # Phase 1 check
 node bid-engine.js           # or pm2 start bid-engine.js --name bid-engine
