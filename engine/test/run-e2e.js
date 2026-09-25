@@ -18,7 +18,7 @@ const ALL_MINUTES = Array.from({ length: 60 }, (_, i) => i).join(',');
 function ensureTestFixtures() {
   const files = path.join(ROOT, 'files');
   if (!fs.existsSync(files)) fs.mkdirSync(files);
-  fs.writeFileSync(path.join(files, 'input2.csv'), 'City Code Description,Special Process Indicator,Bidding Amount\nMUMBAI,1164,1234\nPUNE - STO,,999\nNAGPUR,,500\n');
+  fs.writeFileSync(path.join(files, 'input2.csv'), 'City Code Description,Special Process Indicator,Bidding Amount\nMUMBAI,1164,1234\nPUNE - STO,,999\nNAGPUR,,500\nDELHI,,1500\n');
   fs.writeFileSync(path.join(files, 'delete.csv'), 'Customer\nBLOCKED CO\n');
   fs.writeFileSync(path.join(files, 'priority.csv'), 'Vbeln\n1150000002\n');
   fs.writeFileSync(path.join(ROOT, 'cookie.txt'), 'SAP_SESSIONID=mock-s1; sess_map=abc');
@@ -45,13 +45,17 @@ async function main() {
     METRICS_INTERVAL_MS: '0', L1_UNDERCUT: 'false', LOG_LEVEL: process.env.LOG_LEVEL || 'info',
     STRIKE_MODE: process.env.STRIKE_MODE || 'instant',
   };
+  // Start the engine only while the mock window is CLOSED (second ≥ 31 of the minute) so there is no
+  // mid-window catch-up polluting the measured window, and ≥ 25s before the boundary for clock sync.
+  const secNow = (Date.now() % 60_000) / 1000;
+  if (secNow < 31) { console.log(`[e2e] waiting ${(31 - secNow).toFixed(0)}s for the mock window to close before starting the engine…`); await sleep((31 - secNow) * 1000); }
   const engine = spawn('node', ['bid-engine.js'], { cwd: ROOT, env: engineEnv, stdio: ['ignore', 'inherit', 'inherit'] });
 
-  // Wait until the next minute boundary + 12s (optionally more windows so learned unlock-lag kicks in)
+  // Wait until the next minute boundary + 15s (optionally more windows so learned unlock-lag kicks in)
   const windows = parseInt(process.env.E2E_WINDOWS || '1', 10);
   const now = Date.now();
   const nextMin = now - (now % 60_000) + 60_000;
-  const waitMs = nextMin - now + 12_000 + (nextMin - now < 25_000 ? 60_000 : 0) + (windows - 1) * 60_000;
+  const waitMs = nextMin - now + 15_000 + (nextMin - now < 25_000 ? 60_000 : 0) + (windows - 1) * 60_000;
   console.log(`[e2e] waiting ${(waitMs / 1000).toFixed(0)}s for ${windows} window(s) + settle…`);
   await sleep(waitMs);
 
@@ -72,13 +76,19 @@ async function main() {
   check('priority order (9000000002) saved first', first && first.sapOrderId === '9000000002', first ? `first=${first.sapOrderId}` : 'none');
   check('blacklisted order (9000000003) never bid', !st.saves.some((s) => s.sapOrderId === '9000000003'));
   const timed = (process.env.STRIKE_MODE || 'instant') === 'timed';
-  const saveAt = parseInt(process.env.STRIKE_SAVE_AT_MS || '4000', 10);
+  const saveAt = parseInt(process.env.STRIKE_SAVE_AT_MS || '5000', 10);
   const unlockDelay = parseInt(process.env.MOCK_CAPTCHA_UNLOCK_DELAY_MS || '0', 10);
-  const maxFirst = parseInt(process.env.E2E_MAX_FIRST_MS || String((timed ? saveAt + 700 : 400) + unlockDelay), 10);
+  const maxFirst = parseInt(process.env.E2E_MAX_FIRST_MS || String(timed ? saveAt + 700 : 400 + unlockDelay), 10);
   check('first save within ' + maxFirst + 'ms of SAP boundary', first && first.fromBoundaryMs >= -50 && first.fromBoundaryMs <= maxFirst, first ? `${first.fromBoundaryMs}ms after boundary (mock skew +${st.clockOffsetMs}ms)` : 'none');
   if (timed) {
-    check(`timed strike: first save lands at unlock+${saveAt}ms (±400)`, first && Math.abs(first.fromBoundaryMs - unlockDelay - saveAt) <= 400, first ? `${first.fromBoundaryMs - unlockDelay}ms after unlock` : 'none');
-    check('timed strike: warm phase fetched many captchas without saving', st.captchaIssued >= 15 && st.saves.filter((s) => s.at < first.at).length === 0, `issued=${st.captchaIssued}`);
+    check(`timed strike: first save lands at boundary+${saveAt}ms (±400)`, first && Math.abs(first.fromBoundaryMs - saveAt) <= 400, first ? `${first.fromBoundaryMs}ms after boundary` : 'none');
+    check('timed strike: warm phase fetched many captchas, none saved before the strike', st.captchaFetches >= 30 && st.saves.filter((s) => s.at < first.at && winStart(s) === lastStart).length === 0, `fetches=${st.captchaFetches} issued=${st.captchaIssued} empty=${st.captchaEmpty}`);
+    const lateAt = parseInt(process.env.MOCK_LATE_ORDER_AT_MS || '0', 10);
+    if (lateAt) {
+      const late = okSaves.filter((s) => s.sapOrderId === '9000000004' && winStart(s) === lastStart).sort((a, b) => a.at - b.at)[0];
+      const midWarm = parseInt(process.env.STRIKE_MIDWINDOW_WARM_MS || '5000', 10);
+      check(`mid-window strike: late order saved ≈ ${lateAt}ms + detect + ${midWarm}ms warm`, late && late.fromBoundaryMs >= lateAt + midWarm - 300 && late.fromBoundaryMs <= lateAt + midWarm + 1500, late ? `${late.fromBoundaryMs}ms after boundary` : 'late order never saved');
+    }
   }
   check('captcha lookup correct (no wrong-captcha before first success)', process.env.MOCK_UNKNOWN_RATE ? true : !st.saves.some((s) => !s.ok && first && s.at < first.at), `wrong=${st.wrongCaptcha}`);
   check('MUMBAI order saved at 1234', okSaves.some((s) => s.sapOrderId === '9000000001' && s.amount === '1234.000') || st.waf406 > 0, st.waf406 > 0 && !okSaves.some((s) => s.sapOrderId === '9000000001') ? 'skipped: mock WAF blocked all sessions for the remainder of the window (expected back-off)' : '');

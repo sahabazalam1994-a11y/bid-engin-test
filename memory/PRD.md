@@ -39,11 +39,13 @@ after window open; all vendors bid the same amount → pure latency race. Phases
 - ORDERS_FREEZE_MS=1500 (no order fetch in critical path when plan ready). SESSION_STAGGER_MS default 0.
 - Mock: gateway 404 XML timestamp, MOCK_WAF_DATE_SKEW_MS, unlockDetect stats; e2e E2E_WINDOWS + lag checks (11/11).
 
-## Implemented v4.2 (user request) — STRIKE_MODE
-- `timed` (default per user): after unlock detect → STRIKE_PARALLEL=3 fetchers for STRIKE_WARM_MS=3000 (no save) → final fetch
-  timed so save arrives at unlock+STRIKE_SAVE_AT_MS=4000; once per session per window (STRIKE_PER_ITEM to change);
-  mid-window new matched orders (10→12) trigger the same. `instant` = v4.1 path. `ab` = alternate per window.
-- e2e timed scenario 11/11 (save at unlock+4055ms, 102 warm fetches/session, no early save); instant 9/9 regression.
+## Implemented v4.2 (user request, clarified) — STRIKE_MODE=timed (boundary-anchored)
+- Warm from boundary+STRIKE_WARM_START_MS (-5000 = :44:55): every session × STRIKE_PARALLEL=3 fetchers, fetch→hash→fetch,
+  NO save even if orders match. At boundary+STRIKE_SAVE_AT_MS (+5000 = :45:05) one session per order: final fetch → lookup → save
+  (no race in timed mode). Items dispatched after the last strike (new matched orders mid-window, 10→12) warm
+  STRIKE_MIDWINDOW_WARM_MS=5000 then save. `instant` = v4.1 path. `ab` alternates per window.
+- Boundary reset now clears submitted/cooldown fully (per-window). Mock: MOCK_LATE_ORDER_AT_MS; runner starts engine only
+  when mock window closed. e2e timed 12/12 (save at boundary+4964ms, late order at +13126ms); instant 9/9.
 - Runner now evaluates the LAST window (catch-up saves at engine start were confusing checks).
 
 ## Backlog

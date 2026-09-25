@@ -35,11 +35,11 @@ Expected after 1–2 live windows: `🔓 captcha UNLOCK observed at boundary+~10
 ## v4.2 — Strike modes (`STRIKE_MODE`)
 | Mode | What happens after the captcha unlock is detected |
 |---|---|
-| `timed` (default, as requested) | Fetch captchas **in parallel** (`STRIKE_PARALLEL=3`) for `STRIKE_WARM_MS=3000` **without saving**, then ONE final fetch timed so the save **arrives at unlock + `STRIKE_SAVE_AT_MS=4000`**. Once per session per window (`STRIKE_PER_ITEM=true` → every dispatched item warms). Also applies when orders were not matched at open and new matched orders appear mid-window (10 → 12): the first fire on that session warms 3 s, saves at 4 s. |
+| `timed` (default, as requested) | **Boundary-anchored.** From `boundary + STRIKE_WARM_START_MS` (−5000 → 00:44:55) every session runs `STRIKE_PARALLEL=3` fetchers: fetch → hash → fetch → hash … **no save**, even if orders already match. At `boundary + STRIKE_SAVE_AT_MS` (+5000 → 00:45:05) **one session per order** does the final fetch → lookup → save (no session race). Orders that appear later in the window (10 → 12, matching CSV): the session warms `STRIKE_MIDWINDOW_WARM_MS=5000` then saves. `STRIKE_PER_ITEM=true` → every item warms separately. |
 | `instant` | v4.1 behaviour: save with the first captcha after unlock (≈ unlock + 1 RTT). |
 | `ab` | Alternate `timed` / `instant` per window → compare ranks in `logs/bid-log-*.csv` to prove which wins. |
 
-Honest note: live logs show competitors' saves landing before ~1.4 s after the boundary (our `tied` results). `timed` saves at ~4 s; if SAP ranks by arrival, `instant` should win. Run `STRIKE_MODE=ab` for a day and let the bid-log decide.
+Honest note: live logs show competitors' saves landing before ~1.4 s after the boundary (our `tied` results). `timed` saves at +5 s; if SAP ranks by arrival, `instant` should win. Run `STRIKE_MODE=ab` for a day and let the bid-log decide. WAF: 3 fetchers × 10 s ≈ 200 requests/session per window — drop `STRIKE_PARALLEL` to 1 if you see 406s.
 
 ## Files
 

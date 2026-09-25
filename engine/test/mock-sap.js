@@ -53,6 +53,14 @@ const orders = [
   { SapOrderId: '9000000003', Vbeln: '1150000003', Destination: 'NAGPUR', SPI: '', ClubId: '', Freight: '900.000', KunagName1: 'BLOCKED CO', ShipFromWerks: '6924', BiddingRank: '0', BiddingAmount: '0.000', L1BidAmount: '0.000' },
 ];
 
+const LATE_ORDER_AT_MS = parseInt(process.env.MOCK_LATE_ORDER_AT_MS || '0', 10); // publish a 4th matching order this long after open
+const lateOrder = { SapOrderId: '9000000004', Vbeln: '1150000004', Destination: 'DELHI', SPI: '', ClubId: '', Freight: '1200.000', KunagName1: 'LATE CO', ShipFromWerks: '6924', BiddingRank: '0', BiddingAmount: '0.000', L1BidAmount: '0.000' };
+function visibleOrders() {
+  if (!LATE_ORDER_AT_MS) return orders;
+  const win = lastBoundary(sapNow());
+  return sapNow() >= win + LATE_ORDER_AT_MS ? [...orders, lateOrder] : orders;
+}
+
 const sessions = new Map(); // cookie → { token, activeCaptcha, activeAnswer }
 const stats = { boundaries: [], captchaFetches: 0, captchaEmpty: 0, captchaIssued: 0, saves: [], wrongCaptcha: 0, csrfFail: 0, waf406: 0, sessionSetCalls: 0, orderListCalls: 0 };
 const recentSubmits = [];
@@ -94,7 +102,7 @@ const server = http.createServer(async (req, res) => {
     stats.orderListCalls++;
     await readBody(req);
     if (req.headers['x-csrf-token'] !== s.token) { stats.csrfFail++; return send(res, 403, 'CSRF token validation failed', { 'x-csrf-token': 'Required' }); }
-    const list = windowOpen() ? orders.map((o) => {
+    const list = windowOpen() ? visibleOrders().map((o) => {
       const mine = stats.saves.filter((b) => b.sapOrderId === o.SapOrderId && b.ok);
       const first = mine[0];
       return { ...o, BiddingAmount: first ? first.amount : '0.000', BiddingRank: first ? String(first.rank) : '0', L1BidAmount: first ? first.amount : '0.000' };

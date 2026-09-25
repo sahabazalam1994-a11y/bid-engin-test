@@ -68,13 +68,16 @@ const ORDERS_POLL_LEAD_MS     = envInt('ORDERS_POLL_LEAD_MS', 5000);
 const ORDERS_TIGHT_MS         = envInt('ORDERS_TIGHT_MS', 10);          // back-to-back order fetch gap at boundary
 const ARM_CAPTCHA_AT_BOUNDARY = envBool('ARM_CAPTCHA_AT_BOUNDARY', 'true'); // fetch ONE captcha in parallel with orders
 const ARMED_CAPTCHA_MAX_AGE_MS = envInt('ARMED_CAPTCHA_MAX_AGE_MS', 5000);
-// Strike mode: instant = save with the first captcha after unlock (v4.1 default path)
-//              timed   = after unlock, fetch captchas in parallel for STRIKE_WARM_MS without saving,
-//                        then one final fetch + save arriving at unlock + STRIKE_SAVE_AT_MS
+// Strike mode: instant = save with the first captcha after unlock (v4.1 path)
+//              timed   = boundary-anchored: from boundary+STRIKE_WARM_START_MS (e.g. -5000 = :44:55) fetch captchas
+//                        aggressively in parallel (hash → fetch → hash …) with NO save, then at boundary+STRIKE_SAVE_AT_MS
+//                        (e.g. +5000 = :45:05) ONE session does the final fetch → lookup → save. New matched orders that
+//                        appear mid-window get their own STRIKE_MIDWINDOW_WARM_MS warm → save.
 //              ab      = alternate timed / instant per window to compare ranks in bid-log
 const STRIKE_MODE             = (process.env.STRIKE_MODE || 'timed').toLowerCase();
-const STRIKE_WARM_MS          = envInt('STRIKE_WARM_MS', 3000);
-const STRIKE_SAVE_AT_MS       = envInt('STRIKE_SAVE_AT_MS', 4000);
+const STRIKE_WARM_START_MS    = envInt('STRIKE_WARM_START_MS', -5000);
+const STRIKE_SAVE_AT_MS       = envInt('STRIKE_SAVE_AT_MS', 5000);
+const STRIKE_MIDWINDOW_WARM_MS = envInt('STRIKE_MIDWINDOW_WARM_MS', 5000);
 const STRIKE_PARALLEL         = Math.max(1, envInt('STRIKE_PARALLEL', 3));
 const STRIKE_PER_ITEM         = envBool('STRIKE_PER_ITEM', 'false');      // true = every dispatched item warms; false = once per session per window
 
@@ -1008,6 +1011,42 @@ async function fireItem(ctx, auth, item, race = null) {
       solved = armed.solved; lastCaptchaHash = armed.hash; lastCaptchaRaw = armed.raw; solvedSource = armed.source || 'map'; tCapReq = armed.t0; tCapResp = armed.at;
       metrics.captchaHit++;
       log.info(`[${sid}] ⚡ using armed captcha (fetched ${Date.now() - armed.at}ms ago, in parallel with orders)`);
+    } else if (strikeModeFor(winKey) === 'timed' && (STRIKE_PER_ITEM ? !struckThisItem : (item.dispatchedAt || 0) > (auth.lastStrikeDone || 0))) {
+      // ---- TIMED STRIKE (boundary-anchored). Warm phase = aggressive parallel fetches, no save.
+      struckThisItem = true;
+      const ws = ctx.strike && ctx.strike.winKey === winKey ? ctx.strike : null;
+      let stat; let label;
+      if (ws && Date.now() < ws.finalFetchLocal + 1500) {
+        label = `window strike (warm ${STRIKE_WARM_START_MS / 1000}s → save @boundary+${STRIKE_SAVE_AT_MS}ms)`;
+        log.info(`[${sid}] 🎯 ${label}: order matched — joining warm, NO save until ${new Date(ws.saveArriveLocal).toISOString().slice(11, 23)} local`);
+        stat = await ensureSessionWarm(ctx, auth, ws);
+        const wait = ws.finalFetchLocal - Date.now();
+        if (wait > 0) await sleep(wait);
+      } else {
+        const t0 = Date.now();
+        label = `mid-window strike (new matched orders → warm ${STRIKE_MIDWINDOW_WARM_MS}ms → save)`;
+        log.info(`[${sid}] 🎯 ${label}: ${STRIKE_PARALLEL} parallel fetchers, NO save for ${STRIKE_MIDWINDOW_WARM_MS}ms`);
+        stat = await warmCaptcha(auth, t0 + STRIKE_MIDWINDOW_WARM_MS - clock.rttMs - oneWayMs(), winKey);
+      }
+      if (isRaceDone()) return done({ kind: 'race-lost' });
+      tCapReq = Date.now();
+      const fr = await fetchCaptchaImage(auth);
+      tCapResp = Date.now();
+      auth.lastStrikeDone = tCapResp;              // items dispatched before this moment ride this strike; later ones warm again
+      log.info(`[${sid}] 🎯 warm done: ${stat.fetched} fetches (${stat.known} known/${stat.unknown} unknown/${stat.empty} empty) — FINAL captcha ${fr.img ? 'OK' : 'EMPTY(' + fr.reason + ')'} in ${tCapResp - tCapReq}ms → save now (boundary+${Math.round(tCapResp + clock.offsetMs - winKey)}ms SAP)`);
+      if (!fr.img) {
+        if (fr.reason === 'sap-empty') { emptyCount++; lastEmptyReq = tCapReq; await sleep(CAPTCHA_EMPTY_RETRY_MS + jitter(8)); } else await sleep(150 + jitter(50));
+        continue;                                   // not unlocked yet → normal (instant) loop takes over
+      }
+      const lk = lookupCaptcha(fr.img);
+      lastCaptchaHash = lk.hash; lastCaptchaRaw = lk.raw; solvedSource = 'map';
+      if (!lk.solved) {
+        const fb = await fallbackSolve(lk.raw);
+        if (!fb) { await sleep(30 + jitter(20)); continue; }
+        lk.solved = fb; solvedSource = 'fallback';
+      }
+      metrics.captchaHit++;
+      solved = lk.solved;
     } else {
       // First probe of the window: wait so it ARRIVES at SAP at boundary + learned unlock lag + margin.
       let aimed = false;
@@ -1018,7 +1057,7 @@ async function fireItem(ctx, auth, item, race = null) {
         if (wait > 0 && wait < 120_000) { log.info(`[${sid}] ⏲  holding first probe ${wait}ms → arrives boundary+${clock.unlockLagMs + UNLOCK_MARGIN_MS}ms (lag ${clock.unlockLagMs} + margin ${UNLOCK_MARGIN_MS}, phase ${idx}/${ctx.sessions.length})`); await sleep(wait); }
       }
       tCapReq = Date.now();
-      let { img, reason } = await fetchCaptchaImage(auth);
+      const { img, reason } = await fetchCaptchaImage(auth);
       tCapResp = Date.now();
       if (!img) {
         if (reason === 'sap-empty') {
@@ -1035,23 +1074,6 @@ async function fireItem(ctx, auth, item, race = null) {
         continue;
       }
       noteUnlock(winKey, tCapReq, tCapResp, sid, lastEmptyReq, aimed);
-
-      // ---- TIMED STRIKE: unlock seen → fetch captchas in parallel for STRIKE_WARM_MS (no save),
-      //      then one final fetch timed so the save ARRIVES at unlock + STRIKE_SAVE_AT_MS. Once per session per window.
-      if (strikeModeFor(winKey) === 'timed' && (STRIKE_PER_ITEM ? !struckThisItem : auth.strikeWin !== winKey)) {
-        auth.strikeWin = winKey; struckThisItem = true;
-        const tUnlock = tCapResp;
-        log.info(`[${sid}] 🎯 TIMED STRIKE: unlock seen at boundary+${Math.round(tUnlock + clock.offsetMs - winKey)}ms → warm ${STRIKE_WARM_MS}ms (${STRIKE_PARALLEL} parallel fetchers, no save) → save arrives at unlock+${STRIKE_SAVE_AT_MS}ms`);
-        const warm = await warmCaptcha(auth, tUnlock + STRIKE_WARM_MS);
-        if (isRaceDone()) return done({ kind: 'race-lost' });
-        const finalAt = tUnlock + STRIKE_SAVE_AT_MS - clock.rttMs - oneWayMs();   // final fetch RTT + submit one-way
-        if (finalAt > Date.now()) await sleep(finalAt - Date.now());
-        tCapReq = Date.now();
-        ({ img, reason } = await fetchCaptchaImage(auth));
-        tCapResp = Date.now();
-        log.info(`[${sid}] 🎯 warm done: ${warm.fetched} fetches (${warm.known} known/${warm.unknown} unknown) — final captcha ${img ? 'OK' : 'EMPTY(' + reason + ')'} in ${tCapResp - tCapReq}ms, submitting now (unlock+${tCapResp - tUnlock}ms)`);
-        if (!img) { await sleep(50); continue; }
-      }
 
       const lk = lookupCaptcha(img);
       lastCaptchaHash = lk.hash; lastCaptchaRaw = lk.raw; solvedSource = 'map';
@@ -1202,24 +1224,54 @@ function strikeModeFor(winKey) {
   return STRIKE_MODE === 'timed' ? 'timed' : 'instant';
 }
 
-// Timed-strike warm phase: STRIKE_PARALLEL concurrent captcha fetchers until `untilMs`. No save.
-async function warmCaptcha(auth, untilMs) {
+// Timed-strike warm phase: STRIKE_PARALLEL concurrent captcha fetchers (fetch → hash → fetch …) until
+// `untilMs`, never saving. Also learns the unlock instant (first non-empty after an empty).
+async function warmCaptcha(auth, untilMs, winKey = 0) {
   const stat = { fetched: 0, known: 0, unknown: 0, empty: 0 };
+  auth.warming = true;
   const worker = async () => {
+    let lastEmpty = 0;
     while (Date.now() < untilMs - clock.rttMs && !wafActive(auth)) {
+      const t0 = Date.now();
       const { img } = await fetchCaptchaImage(auth);
       stat.fetched++;
-      if (!img) { stat.empty++; await sleep(40 + jitter(20)); continue; }
+      if (!img) { stat.empty++; lastEmpty = t0; await sleep(40 + jitter(20)); continue; }
+      if (winKey && lastEmpty) noteUnlock(winKey, t0, Date.now(), auth.id, lastEmpty, false);
       const raw = stripDataUri(img);
       if (captchaMap.has(sha256(raw))) stat.known++; else stat.unknown++;
       await sleep(10 + jitter(15));
     }
   };
-  await Promise.all(Array.from({ length: STRIKE_PARALLEL }, worker));
-  // let the last in-flight fetch fully settle so the FINAL fetch is the newest captcha on SAP's side
-  const settle = untilMs - Date.now();
-  if (settle > 0) await sleep(settle);
+  try {
+    await Promise.all(Array.from({ length: STRIKE_PARALLEL }, worker));
+    // let the last in-flight fetch fully settle so the FINAL fetch is the newest captcha on SAP's side
+    const settle = untilMs - Date.now();
+    if (settle > 0) await sleep(settle);
+  } finally { auth.warming = false; }
   return stat;
+}
+
+// Window strike plan (timed mode): warm from boundary+STRIKE_WARM_START_MS, final fetch timed so the
+// save ARRIVES at boundary+STRIKE_SAVE_AT_MS. One warm per session, shared by all items of the window.
+function planWindowStrike(ctx, winKey) {
+  const boundaryLocal = winKey - clock.offsetMs;
+  const saveArriveLocal = boundaryLocal + STRIKE_SAVE_AT_MS;
+  const ws = {
+    winKey,
+    warmStartLocal: boundaryLocal + STRIKE_WARM_START_MS,
+    saveArriveLocal,
+    finalFetchLocal: saveArriveLocal - oneWayMs() - clock.rttMs,   // final fetch RTT + submit one-way
+    warm: {},
+  };
+  ctx.strike = ws;
+  return ws;
+}
+function ensureSessionWarm(ctx, auth, ws) {
+  if (!ws.warm[auth.id]) {
+    ws.warm[auth.id] = warmCaptcha(auth, ws.finalFetchLocal - 20, ws.winKey)
+      .then((stat) => { log.info(`[${auth.id}] 🔥 warm phase over: ${stat.fetched} fetches (${stat.known} known/${stat.unknown} unknown/${stat.empty} empty), ${STRIKE_PARALLEL} parallel`); return stat; });
+  }
+  return ws.warm[auth.id];
 }
 
 // Post-boundary only: fetch ONE captcha per session while orders are still
@@ -1322,6 +1374,7 @@ function pickSession(ctx) {
 }
 
 function dispatchItem(ctx, item, { race = false, stagger = SESSION_STAGGER_MS } = {}) {
+  item.dispatchedAt = Date.now();
   const ids = item.bids.map((b) => String(b.order.SapOrderId));
   for (const id of ids) ctx.inFlight.add(id);
   const release = () => { for (const id of ids) ctx.inFlight.delete(id); };
@@ -1351,7 +1404,7 @@ function dispatchOrders(ctx, orders, source) {
   const win = currentWindowMs();
   log.info(`🚀 [${source}] dispatching ${plan.length} batch(es), ${stats.matched} matched (orders=${stats.total} bl=${stats.blacklisted} no-rule=${stats.noRule} pri=${stats.priority}) ${boundaryStatusText()}`);
   plan.forEach((item, i) => {
-    const raceFirst = FIRE_RACE_FIRST && i === 0 && ctx.racedWin !== win;
+    const raceFirst = FIRE_RACE_FIRST && strikeModeFor(win) !== 'timed' && i === 0 && ctx.racedWin !== win;   // timed: single saver
     if (raceFirst) ctx.racedWin = win;
     dispatchItem(ctx, item, { race: raceFirst });
   });
@@ -1367,7 +1420,7 @@ function startKeepWarm(sessions) {
     if (Date.now() - last < need) return;
     last = Date.now();
     for (const s of sessions) {
-      if (s.mutex._busy || wafActive(s)) continue;
+      if (s.mutex._busy || s.warming || wafActive(s)) continue;
       clockProbe(s).catch(() => {});
     }
   }, 500).unref();
@@ -1383,7 +1436,7 @@ async function main() {
   loadClockState();
   fs.watchFile(CAPTCHA_MAP_FILE, { interval: 5000 }, () => { log.info('🧩 captcha map changed on disk — reloading'); loadCaptchaMap(); });
 
-  log.info(`Config: sessions=${sessions.map((s) => s.id).join(',')} windows=[${WINDOW_MINUTES.join(',')}] IST strike=${STRIKE_MODE}${STRIKE_MODE !== 'instant' ? `(warm ${STRIKE_WARM_MS}ms ×${STRIKE_PARALLEL}, save@unlock+${STRIKE_SAVE_AT_MS}ms)` : ''} batch=${BATCH_SIZE} race-first=${FIRE_RACE_FIRST} max-inflight=${MAX_INFLIGHT_SUBMITS} csrf-lead=${CSRF_REMINT_LEAD_MS}ms clock=${CLOCK_SOURCE} unlock-lag=${UNLOCK_LAG_MS < 0 ? `learned(${clock.unlockLagMs}ms)` : UNLOCK_LAG_MS + 'ms'} margin=${UNLOCK_MARGIN_MS}ms freeze=${ORDERS_FREEZE_MS}ms h2=${SAP_HTTP2} sap=${SAP_ORIGIN}`);
+  log.info(`Config: sessions=${sessions.map((s) => s.id).join(',')} windows=[${WINDOW_MINUTES.join(',')}] IST strike=${STRIKE_MODE}${STRIKE_MODE !== 'instant' ? `(warm from boundary${STRIKE_WARM_START_MS}ms ×${STRIKE_PARALLEL} fetchers, save@boundary+${STRIKE_SAVE_AT_MS}ms, mid-window warm ${STRIKE_MIDWINDOW_WARM_MS}ms)` : ''} batch=${BATCH_SIZE} race-first=${FIRE_RACE_FIRST} max-inflight=${MAX_INFLIGHT_SUBMITS} csrf-lead=${CSRF_REMINT_LEAD_MS}ms clock=${CLOCK_SOURCE} unlock-lag=${UNLOCK_LAG_MS < 0 ? `learned(${clock.unlockLagMs}ms)` : UNLOCK_LAG_MS + 'ms'} margin=${UNLOCK_MARGIN_MS}ms freeze=${ORDERS_FREEZE_MS}ms h2=${SAP_HTTP2} sap=${SAP_ORIGIN}`);
 
   await Promise.all(sessions.map((s) => s.refreshToken().catch((e) => log.warn(`[${s.id}] initial CSRF failed: ${e.message}`))));
   await Promise.all(sessions.map((s) => clockProbe(s)));
@@ -1446,25 +1499,32 @@ async function main() {
     (async () => {
       await syncSapClock(sessions[0]);
       const fireAtLocal = next - clock.offsetMs - fireLeadMs();          // dispatch at boundary; fireItem holds the probe itself
-      const csrfAt = firstProbeLocalMs(next) - CSRF_REMINT_LEAD_MS;      // token minted just before the first probe
+      const timed = strikeModeFor(next) === 'timed';
+      const ws = timed ? planWindowStrike(ctx, next) : null;
+      const csrfAt = timed ? ws.warmStartLocal - CSRF_REMINT_LEAD_MS : firstProbeLocalMs(next) - CSRF_REMINT_LEAD_MS;
       const now = Date.now();
-      log.info(`   ↳ plan: dispatch @${new Date(fireAtLocal).toISOString().slice(11, 23)} local, CSRF @${new Date(csrfAt).toISOString().slice(11, 23)}, first captcha probe arrives boundary+${clock.unlockLagMs + UNLOCK_MARGIN_MS}ms (sessions phased ${sessions.length > 1 ? Math.round(clock.rttMs / sessions.length) : 0}ms apart)`);
+      if (timed) log.info(`   ↳ plan [timed strike]: warm fetch (${STRIKE_PARALLEL}×/session, NO save) from ${new Date(ws.warmStartLocal).toISOString().slice(11, 23)} local (boundary${STRIKE_WARM_START_MS / 1000}s) → final fetch @${new Date(ws.finalFetchLocal).toISOString().slice(11, 23)} → save arrives boundary+${STRIKE_SAVE_AT_MS}ms, single saver per order`);
+      else log.info(`   ↳ plan: dispatch @${new Date(fireAtLocal).toISOString().slice(11, 23)} local, CSRF @${new Date(csrfAt).toISOString().slice(11, 23)}, first captcha probe arrives boundary+${clock.unlockLagMs + UNLOCK_MARGIN_MS}ms (sessions phased ${sessions.length > 1 ? Math.round(clock.rttMs / sessions.length) : 0}ms apart)`);
       setTimeout(() => {
         log.info(`🔑 CSRF re-mint on ${sessions.length} session(s) @ T${(Date.now() + clock.offsetMs - next) >= 0 ? '+' : ''}${Date.now() + clock.offsetMs - next}ms`);
         for (const s of sessions) s.refreshToken().catch((e) => log.warn(`[${s.id}] CSRF re-mint failed: ${e.message}`));
       }, Math.max(0, csrfAt - now));
+      if (timed) {
+        setTimeout(() => {
+          log.info(`🔥 WARM START ${istHHMM(next)}${STRIKE_WARM_START_MS / 1000}s — ${sessions.length} session(s) × ${STRIKE_PARALLEL} fetchers: fetch → hash → fetch … NO save until boundary+${STRIKE_SAVE_AT_MS}ms`);
+          for (const s of sessions) ensureSessionWarm(ctx, s, ws).catch(() => {});
+        }, Math.max(0, ws.warmStartLocal - now));
+      }
       setTimeout(() => {
-        // Reset per-window state
-        const RECENT = 30_000;
-        for (const [k, ts] of ctx.submitted) if (ts < Date.now() - RECENT) ctx.submitted.delete(k);
-        for (const [k, ts] of ctx.cooldown) if (ts < Date.now() - RECENT) ctx.cooldown.delete(k);
+        // Reset per-window state (a new window = every order may be bid again)
+        ctx.submitted.clear(); ctx.cooldown.clear();
         ctx.undercutAttempts.clear(); ctx.ghostRetries.clear(); ctx.adjustAttempts.clear();
         ctx.priorityVbelns = loadPriorityVbelns();
-        log.info(`🕒 BOUNDARY ${istHHMM(next)} (SAP clock) — FIRE. cached orders=${ctx.cachedOrders ? ctx.cachedOrders.length : 0}`);
+        log.info(`🕒 BOUNDARY ${istHHMM(next)} (SAP clock) — FIRE [${strikeModeFor(next)}]. cached orders=${ctx.cachedOrders ? ctx.cachedOrders.length : 0}`);
         // Orders already visible → fire now (captcha loop waits for unlock itself).
         // Else: arm one captcha per session AND fetch orders back-to-back in parallel.
         if (ctx.cachedOrders && ctx.cachedOrders.length && dispatchOrders(ctx, ctx.cachedOrders, 'boundary')) return;
-        for (const s of sessions) armCaptcha(ctx, s, next);
+        if (!timed) for (const s of sessions) armCaptcha(ctx, s, next);
         boundaryOrdersLoop(ctx).catch((e) => log.warn(`boundary loop failed: ${e.message}`));
       }, Math.max(0, fireAtLocal - now));
     })().catch((e) => log.error(`boundary scheduler failed: ${e.message}`));
